@@ -1,6 +1,11 @@
 /data/
 /env/
-/output/
+# Keep final variant sets and their manifest available for GitHub.
+/output/**
+!/output/*/
+!/output/*/merge/
+!/output/*/merge/*.tsv.gz
+!/output/*/merge/manifest.json
 /logs/
 __pycache__/
 *.py[cod]

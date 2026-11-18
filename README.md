@@ -144,7 +144,8 @@ unless absolute. This also holds when invoking `run.sh` by its path from another
 working directory. The default dbSNP location is
 `data/reference/GCF_000001405.40.gz` within this project; set an absolute path
 to reuse an independently staged shared copy. The project-local `.gitignore`
-excludes reference data, environments, outputs, logs and Python caches.
+excludes reference data, environments, intermediate outputs, logs and Python
+caches. Final merged variant sets and their manifest remain available to Git.
 
 Environment creation and downloads run on login. `--check-only`
 does not install, download or submit. The download command reuses existing files;
@@ -226,6 +227,20 @@ output/v0.1.0/
     manifest.json
   merge/                      # concatenated master and ancestry/build manifests
 ```
+
+The default output directory is inside this Git repository. After a successful
+run, `output/v0.1.0/merge/` contains the final compressed master and ancestry/build
+variant sets (`*.tsv.gz`) and `manifest.json`. These files are not ignored, so
+they can be committed and uploaded to GitHub:
+
+```bash
+git add output/v0.1.0/merge/
+git commit -m "Add v0.1.0 variant sets"
+git push
+```
+
+The ignore rules also allow final exports under `output/<version>/merge/` for
+future versions. Keep `output_dir` in that layout to use these rules.
 
 Every ancestry is exported. `VARIANT_KEY` always identifies the normalized
 **GRCh38** allele, providing the cross-build join key. `CHROM,POS,REF,ALT` describe
