@@ -7,12 +7,13 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
 Usage: bash run.sh [options]
   --config FILE         Configuration (relative to this project's root)
   --download-sources    Download missing HapMap3+/Catalog files, then exit
+  --download-references Download reference files/indexes, then exit (no jobs)
   --setup-only          Create environment, install/check dependencies, then exit
   --check-only          Check existing environment/resources; do not submit
   --chromosomes LIST    Autosomes, e.g. 22 or 1-3,22 (default: 1-22)
   --max-concurrent N    Maximum simultaneous chromosome jobs (default: 4)
-Default: fetch missing discovery sources, validate local references, then submit jobs.
-No large references are downloaded automatically. See README.md for staging details.
+Default: fetch missing sources/references, then submit preparation and analysis jobs.
+Reference downloads can require hundreds of GB; completed files are reused and partial transfers resume.
 Environment: PYTHON_MODULE=python/3.13; HVS_TOOL_MODULES="bcftools picard".
 HELP
   exit 0
@@ -26,16 +27,16 @@ download_only=0
 setup_only=0
 for arg in "$@"; do
   [[ "$arg" != --check-only ]] || check_only=1
-  [[ "$arg" != --download-sources ]] || download_only=1
+  [[ "$arg" != --download-sources && "$arg" != --download-references ]] || download_only=1
   [[ "$arg" != --setup-only ]] || setup_only=1
 done
 if (( check_only + download_only + setup_only > 1 )); then
-  echo "Use only one of --setup-only, --check-only or --download-sources." >&2
+  echo "Use only one of --setup-only, --check-only, --download-sources or --download-references." >&2
   exit 1
 fi
 if type module >/dev/null 2>&1; then
   module load "${PYTHON_MODULE:-python/3.13}"
-  if [[ "$download_only" == 0 ]]; then
+  if [[ "$download_only" == 0 || " $* " == *" --download-references "* ]]; then
     read -r -a tool_modules <<< "${HVS_TOOL_MODULES-bcftools picard}"
     for tool_module in "${tool_modules[@]}"; do module load "$tool_module"; done
   fi
@@ -85,7 +86,7 @@ for index, arg in enumerate(args):
         config = Path(arg.split('=', 1)[1]).expanduser()
 from workflow import picard_command
 command = picard_command(json.loads(config.read_text()))
-for tool in ('bcftools', command[0], 'sbatch'):
+for tool in ('bcftools', command[0], 'sbatch', 'curl'):
     if not shutil.which(tool):
         raise SystemExit(f'Missing executable: {tool}. Load its cluster module or add it to PATH, then rerun setup.')
 PYTHON

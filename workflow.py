@@ -26,6 +26,7 @@ DNA = re.compile('[ACGT]+')
 RSID = re.compile(r'rs[0-9]+')
 KEY = ['CHROM', 'POS', 'REF', 'ALT']
 CANDIDATES = ['CHROM', 'POS', 'RSID', 'A0', 'A1', 'SOURCE', 'POS37_NATIVE']
+REFERENCE_CHR1_LENGTHS = {'reference_grch38': 248956422, 'reference_grch37': 249250621}
 
 
 def local(value):
@@ -517,7 +518,7 @@ def process_chromosome(cfg, chrom, directory, output):
         return summary
 
 
-def check_inputs(cfg, chroms):
+def input_inventory(cfg, chroms):
     required = [local(cfg[k]) for k in ('hapmap3_plus', 'gwas_catalog', 'dbsnp_vcf',
                 'reference_grch38', 'reference_grch37', 'chain_38_to_37', 'chain_37_to_38')]
     for key in ('reference_grch38', 'reference_grch37'):
@@ -533,10 +534,16 @@ def check_inputs(cfg, chroms):
             missing_indexes.append(str(vcf)+'.tbi/.csi')
         else:
             required.append(index)
+    required = sorted(set(required))
     missing = [str(p) for p in required if not p.is_file() or not p.stat().st_size]
     missing += missing_indexes
+    return required, missing
+
+
+def check_inputs(cfg, chroms):
+    required, missing = input_inventory(cfg, chroms)
     if missing:
-        raise FileNotFoundError('Stage these local resources/indexes before submitting:\n'+'\n'.join(missing))
+        raise FileNotFoundError('References/indexes are not ready. Run bash run.sh to download and prepare them:\n' + '\n'.join(missing))
     command = picard_command(cfg)
     if '-jar' in command:
         required.append(Path(command[command.index('-jar') + 1]))
@@ -544,7 +551,7 @@ def check_inputs(cfg, chroms):
         if not shutil.which(tool):
             raise FileNotFoundError(f'Missing executable: {tool}')
     # Inspect small FASTA indexes, never the multi-GB FASTAs themselves on login.
-    for key, chr1_length in (('reference_grch38', 248956422), ('reference_grch37', 249250621)):
+    for key, chr1_length in REFERENCE_CHR1_LENGTHS.items():
         fai = pd.read_csv(str(local(cfg[key]))+'.fai', sep='\t', header=None, usecols=[0, 1])
         lengths = fai.set_index(0)[1].to_dict()
         if lengths.get('chr1') != chr1_length or not all(f'chr{c}' in lengths for c in chroms):
@@ -638,11 +645,127 @@ def download_sources(cfg):
     print('Sources staged. Catalog snapshot:', resolved['gwas_catalog_release'], flush=True)
 
 
+REFERENCE_URLS = {
+    'reference_grch38': 'https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz',
+    'reference_grch37': 'https://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/hg19.fa.gz',
+    'chain_38_to_37': 'https://hgdownload.soe.ucsc.edu/goldenPath/hg38/liftOver/hg38ToHg19.over.chain.gz',
+    'chain_37_to_38': 'https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/hg19ToHg38.over.chain.gz',
+    'dbsnp_vcf': 'https://ftp.ncbi.nih.gov/snp/archive/b156/VCF/GCF_000001405.40.gz',
+    'gnomad_vcf': 'https://storage.googleapis.com/gcp-public-data--gnomad/release/4.1/vcf/genomes/gnomad.genomes.v4.1.sites.chr{chrom}.vcf.bgz',
+}
+
+
+def nonempty(path):
+    return path.is_file() and path.stat().st_size > 0
+
+
+def reference_plan(cfg, chroms):
+    urls = {**REFERENCE_URLS, **cfg.get('reference_urls', {})}
+    plan = []
+    for key in REFERENCE_URLS:
+        for chrom in chroms if key == 'gnomad_vcf' else (None,):
+            target = local(cfg[key].format(chrom=chrom))
+            fasta = key.startswith('reference_')
+            if fasta and target.suffix not in ('.fa', '.fasta', '.fna'):
+                raise ValueError(f'{key} must name an uncompressed FASTA (.fa/.fasta/.fna)')
+            plan.append({'key': key, 'target': target,
+                         'download': Path(str(target) + '.gz') if fasta else target,
+                         'url': urls[key].format(chrom=chrom),
+                         'vcf': key.endswith('_vcf')})
+    return plan
+
+
+def download_reference(url, destination):
+    """Use curl's verified TLS, retry and HTTP Range support for large assets."""
+    if nonempty(destination):
+        print(f'Reusing {destination}', flush=True)
+        return
+    if not shutil.which('curl'):
+        raise FileNotFoundError('curl is required for resumable reference downloads; install/load curl')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(destination.name + '.partial')
+    print(f'DOWNLOAD/RESUME {url} -> {destination}', flush=True)
+    base = ['curl', '--fail', '--location', '--silent', '--show-error', '--retry', '5',
+            '--retry-delay', '2', '--connect-timeout', '30', '--speed-limit', '1024',
+            '--speed-time', '120', '--output', str(partial)]
+    result = subprocess.run([*base, '--continue-at', '-', url], check=False)
+    if result.returncode == 33 or (result.returncode == 22 and nonempty(partial)):
+        # Some servers do not support Range. Restart instead of appending a full response.
+        result = subprocess.run([*base, url], check=False)
+    if result.returncode:
+        raise ValueError(f'Reference download failed for {destination} (curl exit {result.returncode}). '
+                         'Rerun the same command to resume; the partial file is retained.')
+    with partial.open('rb') as handle:
+        if handle.read(2) != b'\x1f\x8b':
+            raise ValueError(f'Reference server did not return gzip/BGZF data for {destination}')
+    partial.replace(destination)
+    receipt = {'url': url, 'downloaded_utc': datetime.now(timezone.utc).isoformat(),
+               **identity(destination)}
+    destination.with_name(destination.name + '.download.json').write_text(json.dumps(receipt, indent=2) + '\n')
+
+
+def download_references(cfg, chroms):
+    for item in reference_plan(cfg, chroms):
+        if nonempty(item['target']):
+            print(f'Reusing {item["target"]}', flush=True)
+        else:
+            download_reference(item['url'], item['download'])
+        if item['vcf'] and not any(nonempty(Path(str(item['target']) + ext)) for ext in ('.tbi', '.csi')):
+            receipt = item['download'].with_name(item['download'].name + '.download.json')
+            # Never attach a public index to an independently staged/custom VCF.
+            if receipt.exists() and json.loads(receipt.read_text()).get('url') == item['url']:
+                download_reference(item['url'] + '.tbi', Path(str(item['target']) + '.tbi'))
+
+
+def prepare_references(cfg, chroms):
+    """Runs on a compute node: unpack FASTAs and build absent local indexes."""
+    import pysam
+    for key in ('reference_grch38', 'reference_grch37'):
+        reference = local(cfg[key])
+        if not nonempty(reference):
+            partial = reference.with_name(reference.name + '.partial')
+            with gzip.open(str(reference) + '.gz', 'rb') as incoming, partial.open('wb') as outgoing:
+                if incoming.peek(1)[:1] != b'>':
+                    raise ValueError(f'Not a FASTA download: {reference}.gz')
+                shutil.copyfileobj(incoming, outgoing, length=1024 * 1024)
+            partial.replace(reference)
+        if not nonempty(Path(str(reference) + '.fai')):
+            pysam.faidx(str(reference))
+        dictionary = reference.with_suffix('.dict')
+        if not nonempty(dictionary):
+            partial = dictionary.with_name(dictionary.name + '.partial')
+            if partial.exists():
+                partial.unlink()
+            run(*picard_command(cfg), 'CreateSequenceDictionary', f'R={reference}', f'O={partial}')
+            partial.replace(dictionary)
+    for vcf in sorted({local(cfg['dbsnp_vcf']), *(local(cfg['gnomad_vcf'].format(chrom=c)) for c in chroms)}):
+        if not any(nonempty(Path(str(vcf) + ext)) for ext in ('.tbi', '.csi')):
+            index = Path(str(vcf) + '.tbi')
+            partial = index.with_name(index.name + '.partial')
+            run('bcftools', 'index', '--force', '--tbi', '--output', partial, vcf)
+            partial.replace(index)
+    snapshot = check_inputs(cfg, chroms)
+    provenance = local(cfg['output_dir']) / 'provenance'
+    partial = provenance / 'preflight.json.partial'
+    partial.write_text(json.dumps(snapshot, indent=2) + '\n')
+    partial.replace(provenance / 'preflight.json')
+    return {'validated_inputs': len(snapshot['inputs'])}
+
+
 def submit(cfg, chroms, max_concurrent):
     """Small preflight and dependent submissions only; no reference data are parsed on login."""
-    snapshot = check_inputs(cfg, chroms)
-    if not shutil.which('sbatch'):
-        raise FileNotFoundError('Missing SLURM sbatch command')
+    # Reference files may still be compressed and their indexes absent. Validate
+    # those on the prepare job, then gate every analysis job on its success.
+    command = picard_command(cfg)
+    for tool in ('sbatch', 'bcftools', command[0]):
+        if not shutil.which(tool):
+            raise FileNotFoundError(f'Missing executable: {tool}')
+    needs_prepare = False
+    try:
+        snapshot = check_inputs(cfg, chroms)
+    except FileNotFoundError:
+        needs_prepare = True
+        snapshot = {'config': cfg, 'inputs': [], 'pending_reference_preparation': True}
     output = local(cfg['output_dir'])
     output.mkdir(parents=True, exist_ok=True)
     provenance = output / 'provenance'
@@ -669,7 +792,9 @@ def submit(cfg, chroms, max_concurrent):
         jobs[stage] = job
         (provenance / 'jobs.json').write_text(json.dumps(jobs, indent=2)+'\n')
         return job
-    first = sbatch('candidates', '--job-name=hvs-candidates')
+    preparation = sbatch('prepare', '--job-name=hvs-prepare', '--time=48:00:00') if needs_prepare else None
+    dependency = [f'--dependency=afterok:{preparation}'] if preparation else []
+    first = sbatch('candidates', '--job-name=hvs-candidates', *dependency)
     array = sbatch('chromosome', '--job-name=hvs-chromosome', f'--dependency=afterok:{first}',
                    f'--array={spec}%{max_concurrent}')
     sbatch('merge', '--job-name=hvs-merge', f'--dependency=afterok:{array}')
@@ -697,17 +822,18 @@ def merge(cfg, chroms, directory, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default='config.json')
-    parser.add_argument('--stage', default='submit', choices=['submit', 'check', 'candidates', 'chromosome', 'merge'])
+    parser.add_argument('--stage', default='submit', choices=['submit', 'check', 'prepare', 'candidates', 'chromosome', 'merge'])
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--check-only', action='store_true')
     mode.add_argument('--download-sources', action='store_true')
+    mode.add_argument('--download-references', action='store_true')
     parser.add_argument('--max-concurrent', type=int, default=4)
     parser.add_argument('--chromosomes', default='1-22')
     parser.add_argument('--chrom', type=int, choices=range(1,23))
     args = parser.parse_args()
     if args.check_only:
         args.stage = 'check'
-    if (args.download_sources or args.stage in ('submit', 'check')) and os.environ.get('SLURM_JOB_ID'):
+    if (args.download_sources or args.download_references or args.stage in ('submit', 'check')) and os.environ.get('SLURM_JOB_ID'):
         parser.error('Run downloads/preflight/submission from the login node')
     chroms = []
     for token in args.chromosomes.split(','):
@@ -723,19 +849,25 @@ def main():
     if args.max_concurrent < 1:
         parser.error('--max-concurrent must be positive')
     try:
-        if args.download_sources or args.stage == 'submit':
+        if args.download_sources or args.download_references or args.stage == 'submit':
             download_sources(json.loads(local(args.config).read_text()))
             if args.download_sources:
                 return
         cfg = load_config(args.config)
+        if args.download_references or args.stage == 'submit':
+            download_references(cfg, chroms)
+            if args.download_references:
+                return
     except (OSError, ValueError, EOFError, zipfile.BadZipFile, HTTPException) as exc:
         parser.error(str(exc))
-    if args.stage == 'check':
-        snapshot = check_inputs(cfg, chroms)
-        print(json.dumps(snapshot, indent=2))
-        return
-    if args.stage == 'submit':
-        submit(cfg, chroms, args.max_concurrent)
+    if args.stage in ('check', 'submit'):
+        try:
+            if args.stage == 'check':
+                print(json.dumps(check_inputs(cfg, chroms), indent=2))
+            else:
+                submit(cfg, chroms, args.max_concurrent)
+        except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+            parser.error(str(exc))
         return
     if not os.environ.get('SLURM_JOB_ID'):
         raise SystemExit('Run processing under SLURM; only --stage check belongs on login')
@@ -744,8 +876,11 @@ def main():
     output = local(cfg['output_dir'])
     output.mkdir(parents=True, exist_ok=True)
     preflight = output / 'provenance' / 'preflight.json'
-    if preflight.exists():
-        for expected in json.loads(preflight.read_text())['inputs']:
+    if preflight.exists() and args.stage != 'prepare':
+        snapshot = json.loads(preflight.read_text())
+        if snapshot.get('pending_reference_preparation'):
+            raise ValueError('Reference preparation has not completed; wait for the prepare job')
+        for expected in snapshot['inputs']:
             if identity(expected['path']) != expected:
                 raise ValueError(f'Input changed after submission: {expected["path"]}')
     stage = f'chr_{args.chrom}' if args.stage == 'chromosome' else args.stage
@@ -754,7 +889,9 @@ def main():
         raise FileExistsError(f'{destination} exists; use a new version/output_dir or remove only the failed stage')
     temporary = output / f'.{stage}.{os.environ["SLURM_JOB_ID"]}.partial'
     temporary.mkdir()
-    if args.stage == 'candidates':
+    if args.stage == 'prepare':
+        summary = prepare_references(cfg, chroms)
+    elif args.stage == 'candidates':
         summary = candidates(cfg, temporary)
     elif args.stage == 'chromosome':
         summary = process_chromosome(cfg, args.chrom, temporary, output)

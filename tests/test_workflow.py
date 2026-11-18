@@ -228,7 +228,7 @@ class PreparationTests(unittest.TestCase):
             self.write_catalog()
             (self.root / cfg['hapmap3_plus']).write_bytes(b'existing RDS')
         with patch.object(hvs, 'download_sources', side_effect=stage) as download:
-            with patch.object(hvs, 'submit') as submit:
+            with patch.object(hvs, 'submit') as submit, patch.object(hvs, 'download_references'):
                 with patch('sys.argv', ['workflow.py', '--chromosomes', '22']):
                     hvs.main()
         download.assert_called_once()
@@ -538,7 +538,7 @@ class OfflineIntegrationTests(unittest.TestCase):
 class SubmissionTests(unittest.TestCase):
     def test_dependencies_snapshot_and_duplicate_submission_guard(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = {'output_dir':str(Path(tmp)/'output')}
+            cfg = {'output_dir':str(Path(tmp)/'output'), 'picard_command': ['picard']}
             with patch.object(hvs, 'ROOT', Path(tmp)), patch.object(hvs, 'check_inputs', return_value={}), \
                     patch.object(hvs.shutil, 'which', return_value='/bin/sbatch'), \
                     patch.object(hvs.subprocess, 'check_output', side_effect=['101\n', '102;cluster\n', '103\n']) as submit:

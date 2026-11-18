@@ -10,7 +10,8 @@ pipelines.
 This directory is the complete project root and can be copied or moved into a
 new repository under any name. It contains all code, tests, configuration and
 Python requirements; no files or Python modules from a parent repository are
-needed. Reference datasets are staged separately at the configured paths.
+needed. Missing reference datasets are downloaded automatically to the configured
+paths, or existing shared copies can be reused.
 
 ```text
 .
@@ -123,27 +124,37 @@ that LD can be estimated accurately from a small ancestry sample.
 
 ## Running on the cluster
 
-Run these commands from this project's root (the directory containing `run.sh`):
+Run from this project's root (the directory containing `run.sh`):
 
 ```bash
-# Login: create the environment and install/check dependencies; no data or jobs.
-bash run.sh --setup-only
-
-# Optional: download the two discovery sources before preflight (also prepares dependencies).
-bash run.sh --download-sources
-
-# Edit config.json: local references and output version (Catalog snapshot is automatic).
-# Stage the large resources listed below on shared storage before proceeding.
-
-# Login: lightweight validation only; never scan full reference files here.
-bash run.sh --check-only --chromosomes 22
-
-# Pilot, using a fresh output_dir/version in config.json:
+# One command: environment, downloads, reference preparation and analysis.
 bash run.sh --chromosomes 22
 
-# Production: choose another fresh output_dir/version before this submission.
+# Production: choose a fresh output_dir/version after the pilot.
 bash run.sh --chromosomes 1-22 --max-concurrent 4
 ```
+
+No manual resource download or index creation is required. The default without
+`--chromosomes` processes 1–22. The initial reference download needs substantial
+shared storage: gnomAD chromosome 22 alone is about 8.7 GB and dbSNP b156 is about
+26.6 GB. Files are downloaded on login with `curl`, retried and resumed using
+HTTP Range; existing nonempty files are reused. Only requested gnomAD
+chromosomes are fetched. Reference downloads preserve `.partial` files for resume.
+Reference processing runs on SLURM with no network access.
+
+Optional commands:
+
+```bash
+bash run.sh --setup-only                         # software only; no data or jobs
+bash run.sh --download-sources                   # HapMap3+ and Catalog only
+bash run.sh --download-references --chromosomes 22 # all inputs for chr22; no jobs
+bash run.sh --check-only --chromosomes 22          # offline check; requires prepared indexes
+```
+
+`--download-references` also stages discovery sources. It downloads compressed
+FASTA files and upstream VCF indexes; FASTA unpacking, `.fai`/`.dict` generation,
+and indexing of independently staged VCFs happen in the preparation job on a
+normal run. After download-only, invoke the normal run to complete preparation.
 
 Paths in the configuration, including `--config`, are relative to this directory
 unless absolute. This also holds when invoking `run.sh` by its path from another
@@ -153,10 +164,11 @@ to reuse an independently staged shared copy. The project-local `.gitignore`
 excludes reference data, environments, intermediate outputs, logs and Python
 caches. Final merged variant sets and their manifest remain available to Git.
 
-A normal `bash run.sh` fetches missing HapMap3+ and Catalog sources before
-preflight and submission. `--download-sources` stages them without submitting;
-`--check-only` stays offline. The large gnomAD/dbSNP/FASTA/chain resources must
-still be staged separately.
+A normal `bash run.sh` fetches all missing discovery and reference resources
+before submission. Shared reference paths in `config.json` are reused when
+present. The optional `reference_urls` object can override individual download
+URLs using the same keys as the resource paths; `gnomad_vcf` URLs support
+`{chrom}`. Local paths remain the processing inputs.
 
 HapMap3+ downloads use Figshare's API endpoint, with an alternate download host
 as fallback. The website download URL can return an empty bot challenge, which
@@ -167,7 +179,7 @@ sources are reused. No manual removal of partial files is needed.
 
 Environment creation and downloads run on login. `--setup-only` installs the
 Python dependencies and checks that bcftools, the configured Picard executable
-and SLURM sbatch are available, without requiring reference data or submitting
+and SLURM sbatch/curl are available, without requiring reference data or submitting
 jobs. It can be rerun to reuse the environment and install missing Python
 dependencies. `--check-only`
 does not install, download or submit. The download command reuses existing files;
@@ -203,7 +215,7 @@ No separate Picard download is needed.
 For a different installation, set `picard_command` to `["picard"]` for a wrapper
 on PATH, or `["java", "-jar", "/shared/software/picard.jar"]` for a fixed JAR path.
 Set `HVS_TOOL_MODULES=""` when the tools and Java are already available on PATH.
-Python 3.11+, its venv support, SLURM and the configured tool modules must be
+Python 3.11+, its venv support, curl, SLURM and the configured tool modules must be
 provided by the cluster; setup does not install system software. Picard JARs
 configured with `java -jar` must also be staged at the configured path.
 
@@ -217,16 +229,17 @@ configured package index contains it; setup uses your existing pip index setting
 After updating the repository, rerun `bash run.sh --setup-only`; an existing
 `env/harmonized` can be reused.
 
-The submission consists of a candidates job, a chromosome array, and a merge
-job, linked by `afterok` dependencies. **Each job requests 1 CPU, 8 GiB and 5 hours**;
-Java is capped at 4 GiB. Association parsing, normalization, indexed variant
-queries, liftover and merging run on compute nodes, without network access.
-Discovery-source checksums are also recorded during downloads and, when needed,
-Catalog snapshot identification on login. Download validation also reads the
-discovery files to check their integrity. `SLURM_TMPDIR` holds temporary files.
-The internal `job.sbatch` contains the resource defaults; no LD is computed here.
+The submission creates a **prepare → candidates → chromosome array → merge**
+chain using `afterok` dependencies. The prepare job is omitted if all references
+and indexes already pass preflight. It requests 1 CPU, 8 GiB and 48 hours; analysis
+jobs request 1 CPU, 8 GiB and 5 hours. Java is capped at 4 GiB. Preparation unpacks
+FASTAs, creates FASTA indexes and Picard sequence dictionaries, and builds absent
+VCF indexes. Downloaded official VCFs use their matching public indexes; a custom
+VCF without an index is indexed locally instead. Preparation writes the final
+preflight input inventory before downstream jobs can start. The internal
+`job.sbatch` sets the analysis defaults and `SLURM_TMPDIR` holds working files.
 
-Before submission, stage these resources locally:
+Automatically staged resources (or provide existing paths in `config.json`):
 
 | Resource | Requirements |
 | --- | --- |
@@ -243,9 +256,11 @@ for current public mirrors and checksums. The release resource path is
 as defined by the
 [official resource code](https://github.com/broadinstitute/gnomad_qc/blob/main/gnomad_qc/v4/resources/release.py).
 These are large files: check available shared storage or reuse an institutional
-copy. They are deliberately not downloaded automatically. Downloads belong on
-login; creating indexes or transforming whole references belongs in a separate
-SLURM job. No full-file hashes or scans of these large references run in preflight.
+copy. The downloader uses the public HTTPS mirror of this pinned v4.1 genomes
+path. dbSNP downloads are pinned to [b156](https://ftp.ncbi.nih.gov/snp/archive/b156/VCF/).
+FASTA and chain downloads come from UCSC hg38/hg19. Each downloaded reference
+gets a `.download.json` receipt containing its URL, size and timestamp. No
+full-file hashes or scans of these large references run in login-node preflight.
 
 Reference assemblies, contig naming and chains must agree. The defaults expect
 UCSC-style hg38/hg19 primary autosomes; do not silently mix `1` and `chr1` or use
@@ -360,7 +375,8 @@ Use Python 3.11 or newer (the cluster default is `module load python/3.13`). If
 `run.sh` has already created the environment, only the test and syntax-check
 commands are needed. Tests use small synthetic references and do not require
 SLURM, downloaded datasets, external bcftools/Picard executables or another
-repository. The same `requirements.txt` supplies all their dependencies.
+repository. The reference integration tests use system curl and a local HTTP
+server, with synthetic data and simulated Picard/SLURM commands. The same `requirements.txt` supplies all their dependencies.
 
 Tests cover strict MAF/MAC boundaries, count pooling, significant association
 parsing, native-build checks, reciprocal allele mapping, collision rejection,

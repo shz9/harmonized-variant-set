@@ -3,7 +3,7 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=8G
 #SBATCH --time=05:00:00
-# Internal worker, submitted by run.sh. All inputs must already be local.
+# Internal worker: prepare downloaded references first, then run offline analysis.
 set -euo pipefail
 export HVS_ROOT="$1"
 config_file="$2"
