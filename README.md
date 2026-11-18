@@ -131,30 +131,60 @@ Run from this project's root (the directory containing `run.sh`):
 bash run.sh --chromosomes 22
 
 # Production: choose a fresh output_dir/version after the pilot.
-bash run.sh --chromosomes 1-22 --max-concurrent 4
+bash run.sh --chromosomes 1-22 --max-concurrent 2 --download-workers 4 --scratch-dir /scratch/szabad
 ```
 
 No manual resource download or index creation is required. The default without
-`--chromosomes` processes 1–22. The initial reference download needs substantial
-shared storage: gnomAD chromosome 22 alone is about 8.7 GB and dbSNP b156 is about
-26.6 GB. Files are downloaded on login with `curl`, retried and resumed using
-HTTP Range; existing nonempty files are reused. Only requested gnomAD
-chromosomes are fetched. Reference downloads preserve `.partial` files for resume.
-Reference processing runs on SLURM with no network access.
+`--chromosomes` processes 1–22. Common references are staged first; gnomAD VCFs
+are downloaded **inside chromosome SLURM jobs**, after the candidate list and
+canonical allele keys are available. Defaults are two concurrent chromosome jobs
+and four download threads per job. Each chromosome job requests 8 GiB, four CPUs
+(or `--download-workers`) and 48 hours.
+
+Raw gnomAD files go under `/scratch/szabad/harmonized-variant-set/<output-id>/chr_N/`,
+where the output ID isolates projects/panel versions. `--scratch-dir` or the
+`scratch_dir` config key changes the root. At two jobs, budget up to roughly
+94 GB for raw gnomAD VCFs, plus the shared dbSNP reference and other working files.
+The default dbSNP path is also on `/scratch/szabad/`; it is retained for reuse.
+Existing configured local VCFs are read in place and never deleted.
+
+Downloads use parallel HTTP ranges against the public GCS endpoint, without
+requiring Google credentials or `gcloud`. They stream into a single preallocated
+scratch file rather than keeping a second set of chunk files. A completed-slice
+checkpoint enables resume, conditional ETag requests keep slices on one object
+version, and the completed GCS file is verified against its supplied MD5.
+Progress is logged in the chromosome job's SLURM output. Common-reference
+transfers continue to use resumable curl downloads.
+
+Each job extracts and normalizes only candidate positions, retains exact
+candidate alleles and writes `output/<version>/gnomad_counts/chr_N/counts.tsv.gz`.
+Columns are `VARIANT_KEY,CHROM,POS,REF,ALT,FILTER` plus `AC_<group>,AN_<group>` for
+all source ancestry groups needed by the configuration. Per-ancestry pooled
+counts, MAF/MAC and selection outcomes remain in the existing ancestry audit
+and export files. Duplicate reference records, missing counts, failed filters
+and absent variants retain their separate QC outcomes.
+
+The count table and manifest are published atomically and checked before the
+job deletes its managed raw gnomAD VCF and index. Failed downloads/extractions
+retain scratch data for retry. A matching count cache skips both downloading
+and extraction on a worker retry; input/ancestry-group signatures and a table
+SHA256 prevent stale or corrupt cache reuse. Existing submission/output guards
+still apply: rerunning the launcher does not automatically resubmit failed jobs.
+Chromosome compute nodes need outbound HTTPS access to the download host.
 
 Optional commands:
 
 ```bash
 bash run.sh --setup-only                         # software only; no data or jobs
 bash run.sh --download-sources                   # HapMap3+ and Catalog only
-bash run.sh --download-references --chromosomes 22 # all inputs for chr22; no jobs
+bash run.sh --download-references --chromosomes 22 # common references only; no jobs
 bash run.sh --check-only --chromosomes 22          # offline check; requires prepared indexes
 ```
 
-`--download-references` also stages discovery sources. It downloads compressed
-FASTA files and upstream VCF indexes; FASTA unpacking, `.fai`/`.dict` generation,
-and indexing of independently staged VCFs happen in the preparation job on a
-normal run. After download-only, invoke the normal run to complete preparation.
+`--download-references` also stages discovery sources. It downloads the common
+FASTA, chain and dbSNP resources and the matching dbSNP index. It does not fetch
+gnomAD. FASTA unpacking, `.fai`/`.dict` generation, and indexing of existing local
+VCFs happen in the preparation job on a normal run. After download-only, invoke the normal run to complete preparation.
 
 Paths in the configuration, including `--config`, are relative to this directory
 unless absolute. This also holds when invoking `run.sh` by its path from another
@@ -177,7 +207,8 @@ integrity, and replace the destination only after validation succeeds. Reruns
 restart incomplete `.partial` files and repair empty destination files; completed
 sources are reused. No manual removal of partial files is needed.
 
-Environment creation and downloads run on login. `--setup-only` installs the
+Environment creation and common-reference downloads run on login; gnomAD
+downloads and extraction run on compute nodes. `--setup-only` installs the
 Python dependencies and checks that bcftools, the configured Picard executable
 and SLURM sbatch/curl are available, without requiring reference data or submitting
 jobs. It can be rerun to reuse the environment and install missing Python
@@ -230,14 +261,14 @@ After updating the repository, rerun `bash run.sh --setup-only`; an existing
 `env/harmonized` can be reused.
 
 The submission creates a **prepare → candidates → chromosome array → merge**
-chain using `afterok` dependencies. The prepare job is omitted if all references
-and indexes already pass preflight. It requests 1 CPU, 8 GiB and 48 hours; analysis
-jobs request 1 CPU, 8 GiB and 5 hours. Java is capped at 4 GiB. Preparation unpacks
-FASTAs, creates FASTA indexes and Picard sequence dictionaries, and builds absent
-VCF indexes. Downloaded official VCFs use their matching public indexes; a custom
-VCF without an index is indexed locally instead. Preparation writes the final
-preflight input inventory before downstream jobs can start. The internal
-`job.sbatch` sets the analysis defaults and `SLURM_TMPDIR` holds working files.
+chain using `afterok` dependencies. The prepare job is omitted if all common
+references and indexes already pass preflight. It requests 1 CPU, 8 GiB and
+48 hours; chromosome jobs use the resources described above, while candidates
+and merge jobs request 1 CPU, 8 GiB and 5 hours. Java is capped at 4 GiB.
+Preparation unpacks FASTAs, creates FASTA indexes and Picard dictionaries, and
+builds absent indexes for existing local VCFs. Preparation writes the final
+preflight inventory before downstream jobs can start. `SLURM_TMPDIR` holds
+small working subsets; full gnomAD downloads use the configured shared scratch.
 
 Automatically staged resources (or provide existing paths in `config.json`):
 
@@ -297,6 +328,10 @@ output/v0.1.0/
     rejected37.vcf            # Picard rejects, with FILTER reasons
     rejected_roundtrip.vcf
     manifest.json
+  gnomad_counts/
+    chr_22/
+      counts.tsv.gz           # candidate AC/AN records for configured source ancestry groups
+      manifest.json           # source metadata, candidate signature, table checksum
   merge/                      # concatenated master and ancestry/build manifests
 ```
 

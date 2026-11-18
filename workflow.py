@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Offline construction of a GRCh38 HapMap3+ / GWAS panel with ancestry and build exports."""
 import argparse
+import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import fcntl
 from collections import defaultdict
 from datetime import datetime, timezone
 import gzip
@@ -157,6 +160,10 @@ def load_config(filename):
             raise ValueError('Ancestry names must be uppercase; source groups must be distinct')
         if not set(groups) <= {'afr', 'amr', 'asj', 'eas', 'fin', 'mid', 'nfe', 'sas'}:
             raise ValueError(f'Unsupported gnomAD groups for {name}')
+    cfg.setdefault('scratch_dir', '/scratch/szabad')
+    cfg.setdefault('download_workers', 4)
+    if not isinstance(cfg['download_workers'], int) or not 1 <= cfg['download_workers'] <= 32:
+        raise ValueError('download_workers must be between 1 and 32')
     return resolve_catalog_release(cfg)
 
 
@@ -309,7 +316,7 @@ def normalize(source, destination, reference, directory):
     normalized = directory / (destination.name + '.unsorted.vcf')
     run('bcftools', 'norm', '-f', reference, '-c', 'e', '-Ov', '-o', normalized, source)
     run('bcftools', 'sort', '-Oz', '-o', destination, normalized)
-    run('bcftools', 'index', '--tbi', destination)
+    run('bcftools', 'index', '--force', '--tbi', destination)
     normalized.unlink()
 
 
@@ -327,7 +334,7 @@ def subset_vcf(source, positions, destination, directory):
     regions = directory / (destination.name + '.regions.tsv')
     pd.DataFrame(rows).to_csv(regions, sep='\t', header=False, index=False)
     run('bcftools', 'view', '--regions-overlap', '0', '-R', regions, '-Oz', '-o', destination, source)
-    run('bcftools', 'index', '--tbi', destination)
+    run('bcftools', 'index', '--force', '--tbi', destination)
 
 
 def resolve_candidates(table, dbsnp, fasta):
@@ -449,27 +456,7 @@ def process_chromosome(cfg, chrom, directory, output):
         canonical = tmp / 'canonical.vcf'
         with pysam.FastaFile(str(ref38)) as fasta:
             write_vcf(master, canonical, fasta)
-        # Genome-wide reference frequency query is restricted to canonical candidate positions.
-        gnomad = tmp / 'gnomad.vcf.gz'
-        subset_vcf(local(cfg['gnomad_vcf'].format(chrom=chrom)),
-                   pd.DataFrame({'CHROM': [chrom]*len(master), 'POS': master.POS}), gnomad, tmp)
-        normalized_gnomad = tmp / 'gnomad.normalized.vcf.gz'
-        normalize(gnomad, normalized_gnomad, ref38, tmp)
-        groups = sorted({g for values in cfg['ancestries'].values() for g in values})
-        frequencies, duplicate = {}, set()
-        with pysam.VariantFile(str(normalized_gnomad)) as handle:
-            required = {f'{metric}_{g}' for g in groups for metric in ('AC', 'AN')}
-            if not required <= set(handle.header.info):
-                raise ValueError(f'gnomAD header is missing required ancestry fields: {required - set(handle.header.info)}')
-            for record in handle:
-                if not record.alts or len(record.alts) != 1:
-                    continue
-                key = variant_key(*record_key(record))
-                values = {'PASS': list(record.filter) == ['PASS'],
-                          **{field: record.info.get(field) for field in required}}
-                if key in frequencies:
-                    duplicate.add(key)
-                frequencies[key] = values
+        frequencies, duplicate = candidate_counts(cfg, chrom, master, tmp, output)
         # Build mapping is independent of ancestry filtering and preserves stable GRCh38 IDs.
         lifted, back = tmp / 'lifted37.vcf', tmp / 'returned38.vcf'
         liftover(cfg, canonical, lifted, local(cfg['chain_38_to_37']), ref37, directory / 'rejected37.vcf')
@@ -484,7 +471,8 @@ def process_chromosome(cfg, chrom, directory, output):
         master['POS37'] = master.POS37.astype('Int64')
         master['BUILD37_STATUS'] = master.CHROM37.notna().map({True: 'roundtrip_pass', False: 'unmapped_or_ambiguous_or_failed_validation'})
         master.to_csv(directory / 'master.GRCh38.tsv.gz', sep='\t', index=False)
-        summary = {'candidates': len(table), 'resolved_source_rows': len(resolved), 'canonical_variants': len(master),
+        summary = {'gnomad_counts_table': str(output / 'gnomad_counts' / f'chr_{chrom}' / 'counts.tsv.gz'),
+                   'candidates': len(table), 'resolved_source_rows': len(resolved), 'canonical_variants': len(master),
                    'candidate_rows_by_source': table.SOURCE.value_counts().to_dict(),
                    'unresolved_rows_by_source': rejected.SOURCE.value_counts().to_dict(),
                    'resolution_outcomes': rejected.REASON.value_counts().to_dict(),
@@ -524,7 +512,8 @@ def input_inventory(cfg, chroms):
     for key in ('reference_grch38', 'reference_grch37'):
         reference = local(cfg[key])
         required += [Path(str(reference)+'.fai'), reference.with_suffix('.dict')]
-    vcfs = [local(cfg['dbsnp_vcf'])] + [local(cfg['gnomad_vcf'].format(chrom=c)) for c in chroms]
+    vcfs = [local(cfg['dbsnp_vcf'])] + [p for c in chroms
+        if nonempty(p := local(cfg['gnomad_vcf'].format(chrom=c)))]
     required += vcfs
     missing_indexes = []
     for vcf in vcfs:
@@ -663,6 +652,8 @@ def reference_plan(cfg, chroms):
     urls = {**REFERENCE_URLS, **cfg.get('reference_urls', {})}
     plan = []
     for key in REFERENCE_URLS:
+        if key == 'gnomad_vcf':
+            continue  # Downloaded/extracted per chromosome on compute nodes.
         for chrom in chroms if key == 'gnomad_vcf' else (None,):
             target = local(cfg[key].format(chrom=chrom))
             fasta = key.startswith('reference_')
@@ -738,7 +729,8 @@ def prepare_references(cfg, chroms):
                 partial.unlink()
             run(*picard_command(cfg), 'CreateSequenceDictionary', f'R={reference}', f'O={partial}')
             partial.replace(dictionary)
-    for vcf in sorted({local(cfg['dbsnp_vcf']), *(local(cfg['gnomad_vcf'].format(chrom=c)) for c in chroms)}):
+    vcfs = {local(cfg['dbsnp_vcf'])} | {p for c in chroms if nonempty(p := local(cfg['gnomad_vcf'].format(chrom=c)))}
+    for vcf in sorted(vcfs):
         if not any(nonempty(Path(str(vcf) + ext)) for ext in ('.tbi', '.csi')):
             index = Path(str(vcf) + '.tbi')
             partial = index.with_name(index.name + '.partial')
@@ -750,6 +742,172 @@ def prepare_references(cfg, chroms):
     partial.write_text(json.dumps(snapshot, indent=2) + '\n')
     partial.replace(provenance / 'preflight.json')
     return {'validated_inputs': len(snapshot['inputs'])}
+
+
+
+def parallel_download(url, destination, workers=4, chunk_size=128 * 1024 * 1024):
+    """Resume independently verified HTTP ranges in one preallocated scratch file."""
+    if nonempty(destination):
+        receipt = destination.with_name(destination.name + '.download.json')
+        if not receipt.exists():
+            raise ValueError(f'Missing download receipt for managed scratch file: {destination}')
+        return json.loads(receipt.read_text())
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    headers = {'Accept-Encoding': 'identity', 'User-Agent': 'harmonized-variant-set/0.1'}
+    with urlopen(Request(url, headers=headers, method='HEAD'), timeout=120) as response:
+        size = int(response.headers['Content-Length'])
+        etag = response.headers.get('ETag')
+        remote_hash = ', '.join(response.headers.get_all('x-goog-hash', []))
+        modified = response.headers.get('Last-Modified')
+    if size <= 0:
+        raise ValueError(f'Empty remote object: {url}')
+    source = {'url': url, 'size': size, 'etag': etag, 'last_modified': modified,
+              'remote_hash': remote_hash, 'chunk_size': chunk_size}
+    partial = destination.with_name(destination.name + '.partial')
+    statefile = destination.with_name(destination.name + '.ranges.json')
+    state = {'source': source, 'completed': []}
+    if nonempty(partial) and partial.stat().st_size == size and statefile.exists() and (etag or modified):
+        previous = json.loads(statefile.read_text())
+        if previous.get('source') == source:
+            state = previous
+    chunks = (size + chunk_size - 1) // chunk_size
+    done = {i for i in state['completed'] if isinstance(i, int) and 0 <= i < chunks}
+    fd = os.open(partial, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.ftruncate(fd, size)
+        def fetch(index):
+            start = index * chunk_size
+            end = min(size, start + chunk_size) - 1
+            request_headers = {**headers, 'Range': f'bytes={start}-{end}'}
+            if etag:
+                request_headers['If-Match'] = etag
+            elif modified:
+                request_headers['If-Unmodified-Since'] = modified
+            for attempt in range(3):
+                try:
+                    with urlopen(Request(url, headers=request_headers), timeout=120) as response:
+                        expected_range = f'bytes {start}-{end}/{size}'
+                        if response.status != 206 or response.headers.get('Content-Range') != expected_range:
+                            raise ValueError(f'Server did not honor byte range {expected_range}')
+                        offset = start
+                        while offset <= end:
+                            data = response.read(min(1024 * 1024, end - offset + 1))
+                            if not data:
+                                raise ValueError(f'Truncated range at byte {offset}')
+                            written = 0
+                            while written < len(data):
+                                n = os.pwrite(fd, data[written:], offset + written)
+                                if not n:
+                                    raise OSError('Scratch write made no progress')
+                                written += n
+                            offset += len(data)
+                        if response.read(1):
+                            raise ValueError('Server returned excess range data')
+                    return index
+                except (OSError, ValueError, HTTPException) as exc:
+                    if attempt == 2:
+                        raise ValueError(f'Range {start}-{end} failed for {url}: {exc}') from exc
+                    sleep(attempt + 1)
+        print(f'DOWNLOAD chr object: {size / 1e9:.2f} GB, {workers} connections, {len(done)}/{chunks} slices cached', flush=True)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(fetch, i) for i in range(chunks) if i not in done]
+            for future in as_completed(futures):
+                done.add(future.result())
+                os.fsync(fd)  # Never mark a slice complete before its bytes are durable.
+                state['completed'] = sorted(done)
+                temporary = statefile.with_name(statefile.name + '.tmp')
+                temporary.write_text(json.dumps(state))
+                temporary.replace(statefile)
+                if len(done) == chunks or len(done) % max(1, chunks // 20) == 0:
+                    print(f'{destination.name}: {len(done)}/{chunks} slices complete', flush=True)
+    finally:
+        os.close(fd)
+    # GCS supplies MD5 for the pinned gnomAD objects. Verify the entire object,
+    # since a range response's checksum describes the whole object, not its slice.
+    hashes = dict(item.strip().split('=', 1) for item in remote_hash.split(',') if '=' in item)
+    if 'md5' in hashes:
+        with partial.open('rb') as handle:
+            actual = base64.b64encode(hashlib.file_digest(handle, 'md5').digest()).decode()
+        if actual != hashes['md5']:
+            statefile.unlink(missing_ok=True)  # Redownload all slices on the next attempt.
+            raise ValueError(f'MD5 mismatch for {url}; partial object retained but its slices were invalidated')
+    with partial.open('rb') as handle:
+        if handle.read(2) != b'\x1f\x8b':
+            raise ValueError(f'Not a BGZF/gzip object: {url}')
+    receipt = {**source, 'downloaded_utc': datetime.now(timezone.utc).isoformat(),
+               'md5_verified': 'md5' in hashes, 'download_workers': workers}
+    # Publish receipt first, so a completed managed file always has its metadata.
+    destination.with_name(destination.name + '.download.json').write_text(json.dumps(receipt, indent=2) + '\n')
+    partial.replace(destination)
+    statefile.unlink(missing_ok=True)
+    return receipt
+
+
+def candidate_counts(cfg, chrom, master, work, output):
+    """Cache exact normalized candidate AC/AN records, then release managed VCFs."""
+    import pysam
+    groups = sorted({g for values in cfg['ancestries'].values() for g in values})
+    fields = sorted(f'{metric}_{g}' for g in groups for metric in ('AC', 'AN'))
+    source = local(cfg['gnomad_vcf'].format(chrom=chrom))
+    owned = not nonempty(source)
+    url = cfg.get('reference_urls', {}).get('gnomad_vcf', REFERENCE_URLS['gnomad_vcf']).format(chrom=chrom)
+    signature = {'schema': 1, 'groups': groups, 'release': cfg.get('gnomad_release', '4.1'),
+                 'candidates_sha256': hashlib.sha256(master[['VARIANT_KEY']].to_csv(index=False).encode()).hexdigest(),
+                 'reference': identity(local(cfg['reference_grch38'])),
+                 'source': {'url': url} if owned else identity(source)}
+    namespace = hashlib.sha256(str(output.resolve()).encode()).hexdigest()[:16]
+    managed_source = local(cfg.get('scratch_dir', '/scratch/szabad')) / 'harmonized-variant-set' / namespace / f'chr_{chrom}' / f'gnomad.chr{chrom}.vcf.bgz'
+    cache = output / 'gnomad_counts' / f'chr_{chrom}'
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    with (cache.parent / f'.chr_{chrom}.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not cache.exists():
+            receipt = None
+            if owned:
+                source = managed_source
+                source.parent.mkdir(parents=True, exist_ok=True)
+                receipt = parallel_download(url, source, workers=cfg.get('download_workers', 4))
+                download_reference(url + '.tbi', Path(str(source) + '.tbi'))
+            subset = work / 'gnomad.candidates.vcf.gz'
+            subset_vcf(source, master[['CHROM', 'POS']].assign(CHROM=chrom), subset, work)
+            normalized = work / 'gnomad.normalized.vcf.gz'
+            normalize(subset, normalized, local(cfg['reference_grch38']), work)
+            wanted = set(master.VARIANT_KEY)
+            rows = []
+            with pysam.VariantFile(str(normalized)) as handle:
+                if not set(fields) <= set(handle.header.info):
+                    raise ValueError(f'gnomAD header missing ancestry fields: {set(fields) - set(handle.header.info)}')
+                for record in handle:
+                    if not record.alts or len(record.alts) != 1:
+                        continue
+                    key = variant_key(*record_key(record))
+                    if key in wanted:
+                        rows.append([key, *record_key(record), ';'.join(record.filter),
+                                     *(json.dumps(scalar(record.info.get(f))) for f in fields)])
+            pending = cache.parent / f'.chr_{chrom}.partial'
+            pending.mkdir(exist_ok=True)
+            table = pending / 'counts.tsv.gz'
+            pd.DataFrame(rows, columns=['VARIANT_KEY', *KEY, 'FILTER', *fields]).to_csv(table, sep='\t', index=False)
+            manifest = {'signature': signature, 'ancestries': cfg['ancestries'], 'records': len(rows),
+                        'counts_sha256': digest(table), 'download': receipt}
+            (pending / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+            pending.replace(cache)
+        manifest = json.loads((cache / 'manifest.json').read_text())
+        if manifest['signature'] != signature or digest(cache / 'counts.tsv.gz') != manifest['counts_sha256']:
+            raise ValueError(f'Candidate count cache does not match inputs or checksum: {cache}; use a fresh output version')
+        table = pd.read_csv(cache / 'counts.tsv.gz', sep='\t', dtype=str, keep_default_na=False)
+        frequencies, duplicate = {}, set()
+        for row in table.to_dict('records'):
+            key = row['VARIANT_KEY']
+            if key in frequencies:
+                duplicate.add(key)
+            frequencies[key] = {'PASS': row['FILTER'] == 'PASS', **{f: json.loads(row[f]) for f in fields}}
+        if owned:
+            # Cleanup follows successful table checksum/read validation, including
+            # recovery after a prior job committed its cache but died in cleanup.
+            for suffix in ('', '.tbi', '.tbi.download.json', '.download.json'):
+                Path(str(managed_source) + suffix).unlink(missing_ok=True)
+        return frequencies, duplicate
 
 
 def submit(cfg, chroms, max_concurrent):
@@ -796,7 +954,8 @@ def submit(cfg, chroms, max_concurrent):
     dependency = [f'--dependency=afterok:{preparation}'] if preparation else []
     first = sbatch('candidates', '--job-name=hvs-candidates', *dependency)
     array = sbatch('chromosome', '--job-name=hvs-chromosome', f'--dependency=afterok:{first}',
-                   f'--array={spec}%{max_concurrent}')
+                   f'--array={spec}%{max_concurrent}', '--time=48:00:00',
+                   f'--cpus-per-task={cfg.get("download_workers", 4)}')
     sbatch('merge', '--job-name=hvs-merge', f'--dependency=afterok:{array}')
     print('Submitted:', json.dumps(jobs), '\nFinal manifests:', output / 'merge', flush=True)
 
@@ -827,7 +986,9 @@ def main():
     mode.add_argument('--check-only', action='store_true')
     mode.add_argument('--download-sources', action='store_true')
     mode.add_argument('--download-references', action='store_true')
-    parser.add_argument('--max-concurrent', type=int, default=4)
+    parser.add_argument('--max-concurrent', type=int, default=2)
+    parser.add_argument('--download-workers', type=int)
+    parser.add_argument('--scratch-dir')
     parser.add_argument('--chromosomes', default='1-22')
     parser.add_argument('--chrom', type=int, choices=range(1,23))
     args = parser.parse_args()
@@ -854,6 +1015,12 @@ def main():
             if args.download_sources:
                 return
         cfg = load_config(args.config)
+        if args.download_workers is not None:
+            if not 1 <= args.download_workers <= 32:
+                parser.error('--download-workers must be between 1 and 32')
+            cfg['download_workers'] = args.download_workers
+        if args.scratch_dir is not None:
+            cfg['scratch_dir'] = args.scratch_dir
         if args.download_references or args.stage == 'submit':
             download_references(cfg, chroms)
             if args.download_references:
@@ -888,7 +1055,9 @@ def main():
     if destination.exists():
         raise FileExistsError(f'{destination} exists; use a new version/output_dir or remove only the failed stage')
     temporary = output / f'.{stage}.{os.environ["SLURM_JOB_ID"]}.partial'
-    temporary.mkdir()
+    # SLURM can requeue a job with the same ID; its unpublished stage directory
+    # is safe to reuse, while the completed destination above remains protected.
+    temporary.mkdir(exist_ok=True)
     if args.stage == 'prepare':
         summary = prepare_references(cfg, chroms)
     elif args.stage == 'candidates':

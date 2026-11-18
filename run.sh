@@ -11,9 +11,11 @@ Usage: bash run.sh [options]
   --setup-only          Create environment, install/check dependencies, then exit
   --check-only          Check existing environment/resources; do not submit
   --chromosomes LIST    Autosomes, e.g. 22 or 1-3,22 (default: 1-22)
-  --max-concurrent N    Maximum simultaneous chromosome jobs (default: 4)
-Default: fetch missing sources/references, then submit preparation and analysis jobs.
-Reference downloads can require hundreds of GB; completed files are reused and partial transfers resume.
+  --max-concurrent N    Maximum simultaneous chromosome jobs (default: 2)
+  --download-workers N  Parallel slices per chromosome download (default: 4)
+  --scratch-dir DIR     Raw gnomAD download storage (default: /scratch/szabad)
+Default: stage common references, then submit preparation and chromosome download/extraction jobs.
+Chromosome jobs download gnomAD to scratch, cache candidate counts, then remove their raw VCFs.
 Environment: PYTHON_MODULE=python/3.13; HVS_TOOL_MODULES="bcftools picard".
 HELP
   exit 0

@@ -29,7 +29,7 @@ class StandaloneTests(unittest.TestCase):
         project = MODULE.parent
         cfg = json.loads((project / 'config.json').read_text())
         resources = ['output_dir', 'hapmap3_plus', 'gwas_catalog', 'gnomad_vcf',
-            'dbsnp_vcf', 'reference_grch38', 'reference_grch37',
+            'reference_grch38', 'reference_grch37',
             'chain_38_to_37', 'chain_37_to_38']
         with patch.object(hvs, 'ROOT', project):
             for key in resources:
@@ -78,7 +78,8 @@ class PreparationTests(unittest.TestCase):
         pause.start()
         self.addCleanup(pause.stop)
         self.cfg = json.loads((MODULE.parent / 'config.json').read_text())
-        self.cfg['picard_command'] = ['picard']
+        self.cfg.update(picard_command=['picard'], dbsnp_vcf='data/reference/dbsnp.gz',
+                        scratch_dir=str(self.root / 'scratch'))
         self.config = self.root / 'config.json'
         self.catalog = self.root / self.cfg['gwas_catalog']
         self.catalog.parent.mkdir(parents=True)

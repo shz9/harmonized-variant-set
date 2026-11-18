@@ -1,6 +1,8 @@
 """Reference staging and full orchestration from an empty data directory."""
 from contextlib import redirect_stdout
 import gzip
+import base64
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
@@ -34,7 +36,8 @@ class ReferenceSetupTests(unittest.TestCase):
         root_patch.start()
         self.addCleanup(root_patch.stop)
         self.cfg = json.loads((MODULE.parent / 'config.json').read_text())
-        self.cfg.update(picard_command=['picard'], ancestries={'EUR': ['nfe']})
+        self.cfg.update(picard_command=['picard'], ancestries={'EUR': ['nfe']},
+                        dbsnp_vcf='data/reference/dbsnp.gz', scratch_dir=str(self.root / 'scratch'), download_workers=2)
         pyreadr.write_rds(str(self.remote / 'hm3.rds'), pd.DataFrame({
             'chr': [22], 'pos': [100], 'pos_hg38': [100], 'rsid': ['rs1'], 'a0': ['A'], 'a1': ['G']}))
         rds = self.remote / 'hm3.rds'
@@ -56,13 +59,17 @@ class ReferenceSetupTests(unittest.TestCase):
             pysam.tabix_compress(str(raw), str(self.remote / name))
             pysam.tabix_index(str(self.remote / name), preset='vcf')
         remote = self.remote
+        failed_starts = self.failed_starts = set()
         requests = self.requests = []
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
 
-            def do_GET(self):
+            def do_HEAD(self):
+                self.do_GET(head=True)
+
+            def do_GET(self, head=False):
                 requests.append((self.path, self.headers.get('Range')))
                 filename = remote / self.path.lstrip('/')
                 if not filename.is_file():
@@ -70,12 +77,22 @@ class ReferenceSetupTests(unittest.TestCase):
                     return
                 data = filename.read_bytes()
                 start = int(self.headers['Range'].split('=')[1].split('-')[0]) if 'Range' in self.headers else 0
-                self.send_response(206 if start else 200)
-                if start:
-                    self.send_header('Content-Range', f'bytes {start}-{len(data)-1}/{len(data)}')
-                self.send_header('Content-Length', str(len(data) - start))
+                ranged = 'Range' in self.headers
+                end_text = self.headers.get('Range', '=0-').split('-')[1]
+                end = int(end_text) if end_text else len(data) - 1
+                if ranged and start in failed_starts:
+                    self.send_error(503)
+                    return
+                self.send_response(206 if ranged else 200)
+                if ranged:
+                    self.send_header('Content-Range', f'bytes {start}-{end}/{len(data)}')
+                self.send_header('ETag', '"' + hashlib.md5(data).hexdigest() + '"')
+                self.send_header('x-goog-hash', 'crc32c=fixture')
+                self.send_header('x-goog-hash', 'md5=' + base64.b64encode(hashlib.md5(data).digest()).decode())
+                self.send_header('Content-Length', str(end - start + 1))
                 self.end_headers()
-                self.wfile.write(data[start:])
+                if not head:
+                    self.wfile.write(data[start:end + 1])
 
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         thread = Thread(target=self.server.serve_forever, daemon=True)
@@ -93,6 +110,8 @@ class ReferenceSetupTests(unittest.TestCase):
 
     def stage_discovery_request(self, request, **kwargs):
         url = request.full_url
+        if 'figshare' not in url and 'ebi.ac.uk' not in url:
+            return urlopen(request, **kwargs)
         name = 'hm3.rds' if 'figshare' in url else 'catalog.zip'
         return urlopen(Request(self.base + '/' + name), **kwargs)
 
@@ -135,7 +154,7 @@ class ReferenceSetupTests(unittest.TestCase):
                             provenance = output / 'provenance'
                             self.assertTrue(json.loads((provenance / 'preflight.json').read_text())['pending_reference_preparation'])
                             # Exercise building indexes for independently staged VCFs too.
-                            for key in ('dbsnp_vcf', 'gnomad_vcf'):
+                            for key in ('dbsnp_vcf',):
                                 Path(str(hvs.local(self.cfg[key].format(chrom=22))) + '.tbi').unlink()
                             for stage in ('prepare', 'candidates', 'chromosome', 'merge'):
                                 args = ['workflow.py', '--config', str(provenance / 'config.json'), '--stage', stage,
@@ -144,6 +163,11 @@ class ReferenceSetupTests(unittest.TestCase):
                                     args += ['--chrom', '22']
                                 with patch.dict(os.environ, {'SLURM_JOB_ID': '123', 'SLURM_TMPDIR': str(self.root)}):
                                     with patch('sys.argv', args), redirect_stdout(io.StringIO()):
+                                        if stage == 'chromosome':
+                                            with patch.object(hvs, 'parallel_download', side_effect=ValueError('interrupted transfer')):
+                                                with self.assertRaisesRegex(ValueError, 'interrupted transfer'):
+                                                    hvs.main()
+                                        # Same allocation/job ID, matching a SLURM requeue.
                                         hvs.main()
                             # Existing resources are reused without another HTTP request.
                             count = len(self.requests)
@@ -153,6 +177,11 @@ class ReferenceSetupTests(unittest.TestCase):
             exported = pd.read_csv(output / 'merge' / f'EUR.{build}.tsv.gz', sep='\t')
             self.assertEqual(exported.VARIANT_KEY.tolist(), ['chr22:100:A:G'])
         self.assertFalse(json.loads((provenance / 'preflight.json').read_text()).get('pending_reference_preparation'))
+        counts = output / 'gnomad_counts' / 'chr_22' / 'counts.tsv.gz'
+        self.assertEqual(pd.read_csv(counts, sep='\t').AC_nfe.tolist(), [21])
+        self.assertFalse(list(Path(self.cfg['scratch_dir']).rglob('*.vcf.bgz')))
+        self.assertIn('--cpus-per-task=2', jobs[2])
+        self.assertIn('--array=22%2', jobs[2])
         self.assertTrue((output / 'merge' / 'manifest.json').exists())
         self.assertEqual(len(hvs.input_inventory(self.cfg, [22])[1]), 0)
         self.assertNotIn('/chr1.bgz', [name for name, _ in self.requests])
@@ -174,7 +203,7 @@ class ReferenceSetupTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             hvs.download_references(self.cfg, [22])
         self.assertNotIn('/dbsnp.gz.tbi', [name for name, _ in self.requests])
-        self.assertIn('/chr22.bgz.tbi', [name for name, _ in self.requests])
+        self.assertNotIn('/chr22.bgz.tbi', [name for name, _ in self.requests])
 
     def test_failed_transfer_never_installs_completed_reference(self):
         destination = self.project / 'failed.gz'
@@ -182,6 +211,82 @@ class ReferenceSetupTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'resume'):
                 hvs.download_reference(self.base + '/hg38.fa.gz', destination)
         self.assertFalse(destination.exists())
+
+    def test_parallel_slices_resume_without_retransferring_completed_ranges(self):
+        destination = self.root / 'parallel.bgz'
+        self.failed_starts.add(32)
+        with patch.object(hvs, 'sleep'), redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, 'Range 32-63 failed'):
+                hvs.parallel_download(self.base + '/chr22.bgz', destination, workers=3, chunk_size=32)
+        statefile = destination.with_name(destination.name + '.ranges.json')
+        state = json.loads(statefile.read_text())
+        self.assertTrue(state['completed'])
+        completed = set(state['completed'])
+        self.failed_starts.clear()
+        self.requests.clear()
+        with redirect_stdout(io.StringIO()):
+            receipt = hvs.parallel_download(self.base + '/chr22.bgz', destination, workers=3, chunk_size=32)
+        self.assertTrue(receipt['md5_verified'])
+        self.assertEqual(destination.read_bytes(), (self.remote / 'chr22.bgz').read_bytes())
+        retried = {int(r.split('=')[1].split('-')[0]) // 32 for _, r in self.requests if r}
+        self.assertTrue(completed.isdisjoint(retried))
+
+    def test_count_cache_reuse_preserves_existing_local_vcf(self):
+        source = self.project / self.cfg['gnomad_vcf'].format(chrom=22)
+        source.parent.mkdir(parents=True)
+        source.write_bytes((self.remote / 'chr22.bgz').read_bytes())
+        Path(str(source) + '.tbi').write_bytes((self.remote / 'chr22.bgz.tbi').read_bytes())
+        reference = self.project / self.cfg['reference_grch38']
+        reference.parent.mkdir(parents=True)
+        reference.write_bytes(gzip.decompress((self.remote / 'hg38.fa.gz').read_bytes()))
+        pysam.faidx(str(reference))
+        master = pd.DataFrame([['chr22:100:A:G', 'chr22', 100, 'A', 'G']], columns=['VARIANT_KEY', *hvs.KEY])
+        work = self.root / 'work'
+        work.mkdir()
+        output = self.project / self.cfg['output_dir']
+        with patch.object(hvs, 'run', side_effect=self.native_tools):
+            first = hvs.candidate_counts(self.cfg, 22, master, work, output)
+        with patch.object(hvs, 'run', side_effect=AssertionError('Cache must skip processing')):
+            second = hvs.candidate_counts(self.cfg, 22, master, work, output)
+        self.assertEqual(first, second)
+        self.assertTrue(source.exists())
+        self.assertEqual(second[0]['chr22:100:A:G']['AC_nfe'], 21)
+
+    def test_extraction_failure_preserves_scratch_vcf_until_valid_cache_exists(self):
+        reference = self.project / self.cfg['reference_grch38']
+        reference.parent.mkdir(parents=True)
+        reference.write_bytes(gzip.decompress((self.remote / 'hg38.fa.gz').read_bytes()))
+        pysam.faidx(str(reference))
+        master = pd.DataFrame([['chr22:100:A:G', 'chr22', 100, 'A', 'G']], columns=['VARIANT_KEY', *hvs.KEY])
+        work = self.root / 'work'
+        work.mkdir()
+        output = self.project / self.cfg['output_dir']
+        with patch.object(hvs, 'run', side_effect=self.native_tools):
+            with patch.object(hvs, 'normalize', side_effect=ValueError('synthetic extraction failure')):
+                with self.assertRaisesRegex(ValueError, 'synthetic extraction failure'):
+                    hvs.candidate_counts(self.cfg, 22, master, work, output)
+        self.assertTrue(list(Path(self.cfg['scratch_dir']).rglob('*.vcf.bgz')))
+        self.assertFalse((output / 'gnomad_counts' / 'chr_22').exists())
+        with patch.object(hvs, 'run', side_effect=self.native_tools):
+            frequencies, _ = hvs.candidate_counts(self.cfg, 22, master, work, output)
+        self.assertEqual(frequencies['chr22:100:A:G']['AN_nfe'], 1000)
+        self.assertFalse(list(Path(self.cfg['scratch_dir']).rglob('*.vcf.bgz')))
+
+    def test_parallel_download_rejects_incorrect_object_checksum(self):
+        destination = self.root / 'bad.bgz'
+        payload = (self.remote / 'chr22.bgz').read_bytes()
+        # Preallocated bytes and a forged all-complete checkpoint must still pass checksum validation.
+        url = self.base + '/chr22.bgz'
+        source = {'url': url, 'size': len(payload), 'etag': '"' + hashlib.md5(payload).hexdigest() + '"',
+                  'last_modified': None, 'remote_hash': 'crc32c=fixture, md5=' + base64.b64encode(hashlib.md5(payload).digest()).decode(),
+                  'chunk_size': len(payload)}
+        destination.with_name('bad.bgz.partial').write_bytes(b'X' * len(payload))
+        state = destination.with_name('bad.bgz.ranges.json')
+        state.write_text(json.dumps({'source': source, 'completed': [0]}))
+        with self.assertRaisesRegex(ValueError, 'MD5 mismatch'):
+            hvs.parallel_download(url, destination, workers=2, chunk_size=len(payload))
+        self.assertFalse(destination.exists())
+        self.assertFalse(state.exists())
 
     def test_inventory_deduplicates_missing_resources(self):
         _, missing = hvs.input_inventory(self.cfg, [22])
