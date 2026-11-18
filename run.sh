@@ -11,7 +11,7 @@ Usage: bash run.sh [options]
   --check-only          Check existing environment/resources; do not submit
   --chromosomes LIST    Autosomes, e.g. 22 or 1-3,22 (default: 1-22)
   --max-concurrent N    Maximum simultaneous chromosome jobs (default: 4)
-Default: validate staged local references, then submit candidates -> chromosomes -> merge.
+Default: fetch missing discovery sources, validate local references, then submit jobs.
 No large references are downloaded automatically. See README.md for staging details.
 Environment: PYTHON_MODULE=python/3.13; HVS_TOOL_MODULES="bcftools picard".
 HELP

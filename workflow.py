@@ -5,6 +5,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 import gzip
 import hashlib
+from http.client import HTTPException
 from importlib.metadata import version
 import json
 import math
@@ -14,7 +15,8 @@ import re
 import shutil
 import subprocess
 import tempfile
-from urllib.request import urlopen
+from time import sleep
+from urllib.request import Request, urlopen
 import zipfile
 
 import pandas as pd
@@ -204,7 +206,7 @@ def parse_catalog(chunk, threshold):
     return accepted, rejected
 
 
-def read_hm3(filename):
+def read_hm3(filename, *, with_rejections=False):
     if filename.suffix == '.rds':
         import pyreadr
         frame = pyreadr.read_r(str(filename))[None]
@@ -216,24 +218,37 @@ def read_hm3(filename):
     frame = frame.rename(columns={'chr': 'CHROM', 'pos_hg38': 'POS', 'rsid': 'RSID',
                                   'a0': 'A0', 'a1': 'A1', 'pos': 'POS37_NATIVE'})
     frame['SOURCE'] = 'HAPMAP3_PLUS'
-    frame['CHROM'] = frame.CHROM.map(chrom_number)
-    frame = frame.loc[frame.CHROM.notna(), CANDIDATES].copy()
+    frame = frame[CANDIDATES].copy()
+    chromosome = frame.CHROM.map(chrom_number)
+    pos38 = pd.to_numeric(frame.POS, errors='coerce')
+    pos37 = pd.to_numeric(frame.POS37_NATIVE, errors='coerce')
+    reason = pd.Series('', index=frame.index)
+    checks = [
+        (chromosome.notna(), 'non_autosomal_chromosome'),
+        (pos38.notna(), 'missing_or_invalid_grch38_coordinate'),
+        (pos38.gt(0) & pos38.mod(1).eq(0), 'invalid_grch38_coordinate'),
+        (pos37.gt(0) & pos37.mod(1).eq(0), 'invalid_native_grch37_coordinate'),
+        (frame.RSID.str.fullmatch(RSID.pattern).fillna(False), 'invalid_or_missing_rsid'),
+        ((frame.A0.str.fullmatch('[ACGT]') & frame.A1.str.fullmatch('[ACGT]')
+          & frame.A0.ne(frame.A1)).fillna(False), 'invalid_snp_alleles'),
+    ]
+    for valid, label in checks:
+        reason.loc[reason.eq('') & ~valid] = label
+    rejected = frame.loc[reason.ne('')].copy()
+    rejected['REASON'] = reason.loc[rejected.index]
+    frame = frame.loc[reason.eq('')].copy()
     if frame.empty:
-        raise ValueError('No autosomal HapMap3+ variants')
-    frame['CHROM'] = frame.CHROM.astype(int)
-    for column in ('POS', 'POS37_NATIVE'):
-        number = pd.to_numeric(frame[column], errors='raise')
-        if not (number.gt(0) & number.mod(1).eq(0)).all():
-            raise ValueError(f'Invalid HapMap3+ coordinates: {column}')
-        frame[column] = number.astype('int64')
-    if not (frame.RSID.str.fullmatch(RSID.pattern) & frame.A0.str.fullmatch('[ACGT]')
-            & frame.A1.str.fullmatch('[ACGT]') & frame.A0.ne(frame.A1)).fillna(False).all():
-        raise ValueError('Invalid HapMap3+ SNP coordinates, IDs or alleles')
-    return frame
+        raise ValueError('No valid autosomal HapMap3+ variants with GRCh38 coordinates and rsIDs')
+    frame['CHROM'] = chromosome.loc[frame.index].astype(int)
+    frame['POS'] = pos38.loc[frame.index].astype('int64')
+    frame['POS37_NATIVE'] = pos37.loc[frame.index].astype('int64')
+    return (frame, rejected) if with_rejections else frame
 
 
 def candidates(cfg, directory):
-    frames = [read_hm3(local(cfg['hapmap3_plus']))]
+    hm3, hm3_rejected = read_hm3(local(cfg['hapmap3_plus']), with_rejections=True)
+    hm3_rejected.to_csv(directory / 'hapmap3_unresolved.tsv.gz', sep='\t', index=False)
+    frames = [hm3]
     filename = local(cfg['gwas_catalog'])
     rejected_count = significant = 0
     def consume(handle):
@@ -261,7 +276,10 @@ def candidates(cfg, directory):
     table = pd.concat(frames, ignore_index=True).drop_duplicates()
     for chrom in range(1, 23):
         table.loc[table.CHROM.eq(chrom)].to_csv(directory / f'chr_{chrom}.tsv.gz', sep='\t', index=False)
-    return {'candidate_rows': len(table), 'significant_catalog_rows': significant,
+    return {'candidate_rows': len(table), 'hapmap3_accepted_rows': len(hm3),
+            'hapmap3_rejected_rows': len(hm3_rejected),
+            'hapmap3_rejection_reasons': hm3_rejected.REASON.value_counts().to_dict(),
+            'significant_catalog_rows': significant,
             'unresolved_catalog_rows': rejected_count,
             'source_files': [dict(identity(local(cfg[k])), sha256=digest(local(cfg[k])))
                              for k in ('hapmap3_plus', 'gwas_catalog')]}
@@ -538,38 +556,84 @@ def check_inputs(cfg, chroms):
             'picard_command': command}
 
 
+def validate_source(filename, key):
+    """Validate downloaded payloads before making them available to the pipeline."""
+    if not filename.stat().st_size:
+        raise ValueError('server returned an empty file')
+    if key == 'gwas_catalog':
+        with zipfile.ZipFile(filename) as archive:
+            catalog_member(archive)
+            bad = archive.testzip()
+            if bad:
+                raise ValueError(f'Catalog ZIP checksum failed: {bad}')
+    else:
+        # The published RDS is gzip-compressed. Read through EOF to check its
+        # trailer/CRC, rejecting HTML, truncated streams and compressed error pages.
+        with gzip.open(filename, 'rb') as handle:
+            if handle.read(2) not in (b'X\n', b'A\n', b'B\n'):
+                raise ValueError('response is not a serialized R object')
+            while handle.read(1024 * 1024):
+                pass
+
+
+def download_source(key, destination, urls, attempts=3):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # A fresh temporary file per invocation avoids reusing an interrupted payload.
+    temporary = destination.with_name(destination.name + '.partial')
+    last_error = None
+    for attempt in range(attempts):
+        url = urls[attempt % len(urls)]
+        print(f'DOWNLOAD {url} -> {destination} (attempt {attempt + 1}/{attempts})', flush=True)
+        try:
+            request = Request(url, headers={'User-Agent': 'harmonized-variant-set/0.1',
+                                            'Accept-Encoding': 'identity'})
+            with urlopen(request, timeout=120) as response, temporary.open('wb') as handle:
+                content_type = response.headers.get('Content-Type', '').lower()
+                if response.headers.get('x-amzn-waf-action') or 'text/html' in content_type:
+                    raise ValueError('download endpoint returned a bot challenge/HTML instead of data')
+                metadata = {'final_url': response.url,
+                            'content_disposition': response.headers.get('Content-Disposition'),
+                            'content_length': response.headers.get('Content-Length')}
+                shutil.copyfileobj(response, handle, length=1024 * 1024)
+            size = temporary.stat().st_size
+            length = metadata['content_length']
+            if length is not None and size != int(length):
+                raise ValueError(f'incomplete response: expected {length} bytes, received {size}')
+            validate_source(temporary, key)
+            checksum = digest(temporary)
+            temporary.replace(destination)
+            receipt = {'url': url, 'downloaded_utc': datetime.now(timezone.utc).isoformat(),
+                       **metadata, **identity(destination), 'sha256': checksum}
+            destination.with_name(destination.name + '.download.json').write_text(json.dumps(receipt, indent=2) + '\n')
+            return
+        except (OSError, ValueError, EOFError, zipfile.BadZipFile, HTTPException) as exc:
+            last_error = exc
+            print(f'Download attempt failed for {key}: {exc}', flush=True)
+            if attempt + 1 < attempts:
+                sleep(attempt + 1)
+    raise ValueError(f'Could not download {key} after {attempts} attempts: {last_error}. '
+                     f'No completed source was installed. Check network access or stage the source at {destination}.') from last_error
+
+
 def download_sources(cfg):
-    """Download only the two small discovery sources; large indexed references are staged separately."""
+    """Stage discovery sources only; never download the large reference resources."""
     sources = {
-        'hapmap3_plus': 'https://figshare.com/ndownloader/files/37802721',
-        'gwas_catalog': 'https://ftp.ebi.ac.uk/pub/databases/gwas/releases/latest/gwas-catalog-associations_ontology-annotated-full.zip',
+        'hapmap3_plus': ('https://api.figshare.com/v2/file/download/37802721',
+                        'https://ndownloader.figshare.com/files/37802721'),
+        'gwas_catalog': ('https://ftp.ebi.ac.uk/pub/databases/gwas/releases/latest/gwas-catalog-associations_ontology-annotated-full.zip',),
     }
-    for key, url in sources.items():
+    for key, urls in sources.items():
         destination = local(cfg[key])
-        if destination.exists():
-            if not destination.is_file() or not destination.stat().st_size:
-                raise ValueError(f'Existing source is not a nonempty file: {destination}; move it aside before retrying')
+        if destination.is_file() and destination.stat().st_size:
             print(f'Reusing {destination}', flush=True)
             continue
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(destination.name+'.partial')
-        print(f'DOWNLOAD {url} -> {destination}', flush=True)
-        with urlopen(url, timeout=120) as response, temporary.open('wb') as handle:
-            response_metadata = {'final_url': response.url,
-                                 'content_disposition': response.headers.get('Content-Disposition'),
-                                 'content_length': response.headers.get('Content-Length')}
-            shutil.copyfileobj(response, handle, length=1024*1024)
-        size = temporary.stat().st_size
-        expected_size = response_metadata['content_length']
-        if not size or (expected_size is not None and size != int(expected_size)):
-            raise ValueError(f'Incomplete source download: {destination}; rerun --download-sources')
-        if key == 'gwas_catalog':
-            with zipfile.ZipFile(temporary) as archive:
-                catalog_member(archive)
-        temporary.replace(destination)
-        receipt = {'url': url, 'downloaded_utc': datetime.now(timezone.utc).isoformat(),
-                   **response_metadata, **identity(destination), 'sha256': digest(destination)}
-        destination.with_name(destination.name+'.download.json').write_text(json.dumps(receipt, indent=2)+'\n')
+        if destination.exists() and not destination.is_file():
+            raise ValueError(f'Source path is not a file: {destination}')
+        expected_suffix = '.rds' if key == 'hapmap3_plus' else '.zip'
+        if destination.suffix.lower() != expected_suffix:
+            raise ValueError(f'Automatic download requires {key} to use {expected_suffix}; '
+                             f'stage your custom-format source manually at {destination}')
+        download_source(key, destination, urls)
     resolved = resolve_catalog_release(dict(cfg))
     print('Sources staged. Catalog snapshot:', resolved['gwas_catalog_release'], flush=True)
 
@@ -641,15 +705,10 @@ def main():
     parser.add_argument('--chromosomes', default='1-22')
     parser.add_argument('--chrom', type=int, choices=range(1,23))
     args = parser.parse_args()
-    if args.download_sources:
-        if os.environ.get('SLURM_JOB_ID'):
-            parser.error('Downloads belong on the login node')
-        download_sources(json.loads(local(args.config).read_text()))
-        return
-    try:
-        cfg = load_config(args.config)
-    except (ValueError, FileNotFoundError, zipfile.BadZipFile) as exc:
-        parser.error(str(exc))
+    if args.check_only:
+        args.stage = 'check'
+    if (args.download_sources or args.stage in ('submit', 'check')) and os.environ.get('SLURM_JOB_ID'):
+        parser.error('Run downloads/preflight/submission from the login node')
     chroms = []
     for token in args.chromosomes.split(','):
         if not re.fullmatch(r'[0-9]+(?:-[0-9]+)?', token):
@@ -663,10 +722,14 @@ def main():
         parser.error('Use autosomes 1-22')
     if args.max_concurrent < 1:
         parser.error('--max-concurrent must be positive')
-    if args.check_only:
-        args.stage = 'check'
-    if args.stage in ('submit', 'check') and os.environ.get('SLURM_JOB_ID'):
-        parser.error('Run preflight/submission from the login node')
+    try:
+        if args.download_sources or args.stage == 'submit':
+            download_sources(json.loads(local(args.config).read_text()))
+            if args.download_sources:
+                return
+        cfg = load_config(args.config)
+    except (OSError, ValueError, EOFError, zipfile.BadZipFile, HTTPException) as exc:
+        parser.error(str(exc))
     if args.stage == 'check':
         snapshot = check_inputs(cfg, chroms)
         print(json.dumps(snapshot, indent=2))

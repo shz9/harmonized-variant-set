@@ -28,7 +28,10 @@ needed. Reference datasets are staged separately at the configured paths.
 ## Selection procedure
 
 1. **Freeze discovery sources.** Start with the published LDpred2 HapMap3+ map,
-   which contains 1,444,196 SNPs and coordinates in both builds. Add **curated
+   which contains 1,444,196 SNPs. Source rows without GRCh38 coordinates,
+   valid rsIDs or valid SNP alleles are excluded and recorded with reasons in
+   `candidates/hapmap3_unresolved.tsv.gz`; counts appear in the candidate-stage
+   manifest. Add **curated
    GWAS Catalog association records with p < 5 × 10⁻⁸**, across all traits and
    study ancestries. This does not search full summary-statistics datasets.
    Preserve the complete significant association records, including study
@@ -126,7 +129,7 @@ Run these commands from this project's root (the directory containing `run.sh`):
 # Login: create the environment and install/check dependencies; no data or jobs.
 bash run.sh --setup-only
 
-# Login: download only the two discovery sources (also prepares Python dependencies).
+# Optional: download the two discovery sources before preflight (also prepares dependencies).
 bash run.sh --download-sources
 
 # Edit config.json: local references and output version (Catalog snapshot is automatic).
@@ -149,6 +152,18 @@ working directory. The default dbSNP location is
 to reuse an independently staged shared copy. The project-local `.gitignore`
 excludes reference data, environments, intermediate outputs, logs and Python
 caches. Final merged variant sets and their manifest remain available to Git.
+
+A normal `bash run.sh` fetches missing HapMap3+ and Catalog sources before
+preflight and submission. `--download-sources` stages them without submitting;
+`--check-only` stays offline. The large gnomAD/dbSNP/FASTA/chain resources must
+still be staged separately.
+
+HapMap3+ downloads use Figshare's API endpoint, with an alternate download host
+as fallback. The website download URL can return an empty bot challenge, which
+is detected and rejected. Downloads retry up to three times, validate gzip/ZIP
+integrity, and replace the destination only after validation succeeds. Reruns
+restart incomplete `.partial` files and repair empty destination files; completed
+sources are reused. No manual removal of partial files is needed.
 
 Environment creation and downloads run on login. `--setup-only` installs the
 Python dependencies and checks that bcftools, the configured Picard executable
@@ -207,8 +222,9 @@ job, linked by `afterok` dependencies. **Each job requests 1 CPU, 8 GiB and 5 ho
 Java is capped at 4 GiB. Association parsing, normalization, indexed variant
 queries, liftover and merging run on compute nodes, without network access.
 Discovery-source checksums are also recorded during downloads and, when needed,
-Catalog snapshot identification on login. `SLURM_TMPDIR` holds temporary files. The internal
-`job.sbatch` contains the resource defaults; no LD is computed here.
+Catalog snapshot identification on login. Download validation also reads the
+discovery files to check their integrity. `SLURM_TMPDIR` holds temporary files.
+The internal `job.sbatch` contains the resource defaults; no LD is computed here.
 
 Before submission, stage these resources locally:
 
@@ -255,7 +271,8 @@ workflow does not automatically resume partially completed releases.
 ```text
 output/v0.1.0/
   provenance/                 # submitted config/code, input metadata, job IDs
-  candidates/                 # per-chromosome candidates, full significant associations, unresolved rows
+  candidates/                 # per-chromosome candidates, association evidence, rejection audits
+    hapmap3_unresolved.tsv.gz  # source rows lacking usable coordinates/IDs/alleles
   chr_22/
     master.GRCh38.tsv.gz       # all canonical variants, source labels, rsID aliases, mapping status
     EUR.audit.tsv.gz          # every master variant plus counts and selection outcome

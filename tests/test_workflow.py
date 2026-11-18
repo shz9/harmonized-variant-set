@@ -1,11 +1,14 @@
 from contextlib import redirect_stdout
+import gzip
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import tempfile
+from threading import Thread
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -71,6 +74,9 @@ class PreparationTests(unittest.TestCase):
         self.root_patch = patch.object(hvs, 'ROOT', self.root)
         self.root_patch.start()
         self.addCleanup(self.root_patch.stop)
+        pause = patch.object(hvs, 'sleep')
+        pause.start()
+        self.addCleanup(pause.stop)
         self.cfg = json.loads((MODULE.parent / 'config.json').read_text())
         self.cfg['picard_command'] = ['picard']
         self.config = self.root / 'config.json'
@@ -201,18 +207,43 @@ class PreparationTests(unittest.TestCase):
                                        (b'not a zip', None, zipfile.BadZipFile),
                                        (empty_archive.getvalue(), None, ValueError)):
             with self.subTest(payload=payload):
-                with patch.object(hvs, 'urlopen', return_value=self.response(payload, length)):
-                    with redirect_stdout(io.StringIO()), self.assertRaises(error):
+                with patch.object(hvs, 'urlopen', side_effect=lambda *a, **k: self.response(payload, length)):
+                    with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, 'after 3 attempts'):
                         hvs.download_sources(self.cfg)
                 self.assertFalse(self.catalog.exists())
                 self.assertFalse(self.catalog.with_name(self.catalog.name + '.download.json').exists())
 
-    def test_existing_empty_source_is_not_silently_reused(self):
+    def test_existing_empty_source_is_repaired_automatically(self):
         (self.root / self.cfg['hapmap3_plus']).touch()
-        with patch.object(hvs, 'urlopen') as network:
-            with self.assertRaisesRegex(ValueError, 'nonempty file'):
+        self.write_catalog()
+        payload = gzip.compress(b'X\nserialized R fixture')
+        with patch.object(hvs, 'urlopen', side_effect=lambda *a, **k: self.response(payload)) as network:
+            with redirect_stdout(io.StringIO()):
                 hvs.download_sources(self.cfg)
-        network.assert_not_called()
+        network.assert_called_once()
+        self.assertEqual((self.root / self.cfg['hapmap3_plus']).read_bytes(), payload)
+
+    def test_submit_stages_sources_before_loading_configuration(self):
+        def stage(cfg):
+            self.write_catalog()
+            (self.root / cfg['hapmap3_plus']).write_bytes(b'existing RDS')
+        with patch.object(hvs, 'download_sources', side_effect=stage) as download:
+            with patch.object(hvs, 'submit') as submit:
+                with patch('sys.argv', ['workflow.py', '--chromosomes', '22']):
+                    hvs.main()
+        download.assert_called_once()
+        self.assertEqual(submit.call_args.args[1], [22])
+        self.assertIn('r2026-10-30', submit.call_args.args[0]['gwas_catalog_release'])
+
+    def test_download_cli_reports_failure_without_traceback(self):
+        with patch.object(hvs, 'download_sources', side_effect=ValueError('network unavailable')):
+            with patch('sys.argv', ['workflow.py', '--download-sources']):
+                with redirect_stdout(io.StringIO()), patch('sys.stderr', new_callable=io.StringIO) as stderr:
+                    with self.assertRaises(SystemExit) as error:
+                        hvs.main()
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn('network unavailable', stderr.getvalue())
+        self.assertNotIn('Traceback', stderr.getvalue())
 
     def test_preflight_and_submission_freeze_resolved_snapshot(self):
         self.write_catalog('catalog.tsv')
@@ -247,6 +278,73 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(frozen['gwas_catalog_snapshot'], cfg['gwas_catalog_snapshot'])
         self.assertEqual(frozen['gwas_catalog_release'], cfg['gwas_catalog_release'])
         self.assertEqual(json.loads(self.config.read_text())['gwas_catalog_release'], 'auto')
+
+
+class DownloadHTTPTests(unittest.TestCase):
+    """Real urllib requests exercise challenges, truncation, fallback and retries."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.destination = Path(self.tmp.name) / 'map.rds'
+        self.payload = gzip.compress(b'X\nserialized R fixture')
+        calls = self.calls = []
+        payload = self.payload
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                calls.append(self.path)
+                self.send_response(200)
+                if self.path == '/challenge':
+                    self.send_header('Content-Type', 'text/html')
+                    self.send_header('x-amzn-waf-action', 'challenge')
+                    body = b''
+                elif self.path == '/truncated':
+                    body = payload[:12]
+                elif self.path == '/corrupt':
+                    body = b'<html>error</html>'
+                else:
+                    body = payload
+                self.send_header('Content-Length', str(len(payload) if self.path == '/truncated' else len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.close_connection = True
+
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = Thread(target=self.server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(self.server.shutdown)
+        self.base = 'http://127.0.0.1:' + str(self.server.server_port)
+        pause = patch.object(hvs, 'sleep')
+        pause.start()
+        self.addCleanup(pause.stop)
+
+    def test_empty_bot_challenge_falls_back_to_working_endpoint(self):
+        with redirect_stdout(io.StringIO()):
+            hvs.download_source('hapmap3_plus', self.destination,
+                                (self.base + '/challenge', self.base + '/good'))
+        self.assertEqual(self.calls, ['/challenge', '/good'])
+        self.assertEqual(self.destination.read_bytes(), self.payload)
+        receipt = json.loads(self.destination.with_name('map.rds.download.json').read_text())
+        self.assertEqual(receipt['sha256'], hashlib.sha256(self.payload).hexdigest())
+
+    def test_truncated_download_fails_then_clean_rerun_recovers(self):
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, 'after 3 attempts'):
+            hvs.download_source('hapmap3_plus', self.destination, (self.base + '/truncated',))
+        self.assertFalse(self.destination.exists())
+        with redirect_stdout(io.StringIO()):
+            hvs.download_source('hapmap3_plus', self.destination, (self.base + '/good',))
+        self.assertEqual(self.destination.read_bytes(), self.payload)
+        self.assertFalse(self.destination.with_name('map.rds.partial').exists())
+
+    def test_html_with_success_status_cannot_be_installed_as_rds(self):
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, 'after 3 attempts'):
+            hvs.download_source('hapmap3_plus', self.destination, (self.base + '/corrupt',))
+        self.assertFalse(self.destination.exists())
 
 
 class FrequencyTests(unittest.TestCase):
@@ -294,6 +392,18 @@ class CandidateTests(unittest.TestCase):
             table = hvs.read_hm3(filename)
             self.assertEqual(table.POS.tolist(), [100])
             self.assertEqual(table.POS37_NATIVE.tolist(), [90])
+
+    def test_unmapped_coordinates_and_non_rsid_rows_are_audited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            filename = Path(tmp) / 'hm3.tsv'
+            pd.DataFrame({'chr': [22] * 4, 'pos': [90, 91, 92, 93],
+                          'pos_hg38': ['100', '', '102', '103'],
+                          'rsid': ['rs1', 'rs2', '22:92:A:G', 'rs4'],
+                          'a0': ['A', 'A', 'A', 'N'], 'a1': ['G'] * 4}).to_csv(filename, sep='\t', index=False)
+            frame, rejected = hvs.read_hm3(filename, with_rejections=True)
+            self.assertEqual(frame.RSID.tolist(), ['rs1'])
+            self.assertEqual(rejected.REASON.tolist(), ['missing_or_invalid_grch38_coordinate',
+                                                       'invalid_or_missing_rsid', 'invalid_snp_alleles'])
 
     def test_reads_published_rds_format(self):
         with tempfile.TemporaryDirectory() as tmp:
