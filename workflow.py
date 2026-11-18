@@ -58,7 +58,6 @@ def run(*args):
     subprocess.run(list(map(str, args)), check=True)
 
 
-
 def picard_command(cfg):
     """Resolve module environment variables without invoking a shell."""
     command = cfg['picard_command']
@@ -78,6 +77,65 @@ def picard_command(cfg):
         command[index] = str(jar)
     return command
 
+
+def catalog_member(archive):
+    """Find the full Catalog table without reading/decompressing its contents."""
+    members = [m for m in archive.namelist() if not m.endswith('/')
+               and not m.startswith('__MACOSX/') and Path(m).name != '.DS_Store']
+    if len(members) != 1:
+        raise ValueError('Use the single full Catalog TSV ZIP, not the publication-year split ZIP')
+    member = members[0]
+    if not archive.getinfo(member).file_size:
+        raise ValueError('GWAS Catalog archive contains an empty table')
+    return member
+
+
+def catalog_snapshot(filename):
+    """Identify the staged file offline; never assign today's release to an older download."""
+    filename = Path(filename)
+    if not filename.is_file() or not filename.stat().st_size:
+        raise FileNotFoundError(f'GWAS Catalog missing or empty: {filename}. Run bash run.sh --download-sources or stage it locally.')
+    names = [filename.name]
+    metadata = {}
+    if filename.suffix.lower() == '.zip':
+        with zipfile.ZipFile(filename) as archive:
+            member = catalog_member(archive)
+        names.append(Path(member).name)
+        metadata['archive_member'] = member
+    # Official filenames use rYYYY-MM-DD for the release and eNNN for Ensembl.
+    dates = {match for name in names for match in re.findall(r'(?:^|[_-])r(\d{4}-\d{2}-\d{2})(?=[_.-]|$)', name)}
+    ensembl = {match for name in names for match in re.findall(r'(?:^|[_-])e(\d+)(?=[_.-]|$)', name)}
+    if len(dates) > 1 or len(ensembl) > 1:
+        raise ValueError(f'Conflicting GWAS Catalog release metadata in filename/archive: {filename}')
+    if dates:
+        date = next(iter(dates))
+        datetime.strptime(date, '%Y-%m-%d')
+        metadata.update(release=f'GWAS Catalog r{date}', identification='versioned_filename')
+    else:
+        # Generic filenames still have an exact reproducible identity. This is a
+        # local snapshot identifier, not a claim about the upstream release date.
+        checksum = digest(filename)
+        metadata.update(release=f'local-sha256:{checksum}', sha256=checksum,
+                        identification='content_sha256', upstream_release='unknown')
+    if ensembl:
+        metadata['ensembl_release'] = next(iter(ensembl))
+        metadata['release'] += f" e{metadata['ensembl_release']}"
+    return metadata
+
+
+def resolve_catalog_release(cfg):
+    release = cfg.get('gwas_catalog_release')
+    if release is not None and not isinstance(release, str):
+        raise ValueError('gwas_catalog_release must be a string or null (use auto for automatic identification)')
+    if release is None or not release.strip() or release.strip().lower() == 'auto' or 'REPLACE_' in release:
+        snapshot = catalog_snapshot(local(cfg['gwas_catalog']))
+        cfg['gwas_catalog_release'] = snapshot['release']
+        cfg['gwas_catalog_snapshot'] = snapshot
+    else:
+        cfg['gwas_catalog_release'] = release.strip()
+    return cfg
+
+
 def load_config(filename):
     cfg = json.loads(local(filename).read_text())
     cfg['picard_command'] = picard_command(cfg)
@@ -85,8 +143,6 @@ def load_config(filename):
         raise ValueError('Initial workflow requires GRCh38 Catalog mappings and gnomAD genomes')
     if cfg['gnomad_release'] != '4.1':
         raise ValueError('This workflow is pinned to gnomAD genomes v4.1; audit headers before changing release')
-    if not cfg['gwas_catalog_release'].strip() or 'REPLACE_' in cfg['gwas_catalog_release']:
-        raise ValueError('Record the downloaded GWAS Catalog snapshot/release in config.json')
     if not 0 < cfg['maf_gt'] < 0.5 or not isinstance(cfg['mac_gt'], int) or cfg['mac_gt'] < 0:
         raise ValueError('Invalid MAF/MAC thresholds')
     if not 0 < cfg['gwas_p_threshold'] <= 5e-8:
@@ -98,7 +154,7 @@ def load_config(filename):
             raise ValueError('Ancestry names must be uppercase; source groups must be distinct')
         if not set(groups) <= {'afr', 'amr', 'asj', 'eas', 'fin', 'mid', 'nfe', 'sas'}:
             raise ValueError(f'Unsupported gnomAD groups for {name}')
-    return cfg
+    return resolve_catalog_release(cfg)
 
 
 def scalar(value):
@@ -196,12 +252,9 @@ def candidates(cfg, directory):
             rejected.to_csv(directory / 'gwas_unresolved.tsv.gz', sep='\t', index=False,
                             mode='w' if first else 'a', header=first, compression='gzip')
             first = False
-    if filename.suffix == '.zip':
+    if filename.suffix.lower() == '.zip':
         with zipfile.ZipFile(filename) as archive:
-            members = [m for m in archive.namelist() if not m.endswith('/') and not m.startswith('__MACOSX/')]
-            if len(members) != 1:
-                raise ValueError('Use the single full Catalog TSV ZIP, not the publication-year split ZIP')
-            with archive.open(members[0]) as handle:
+            with archive.open(catalog_member(archive)) as handle:
                 consume(handle)
     else:
         consume(filename)
@@ -494,6 +547,8 @@ def download_sources(cfg):
     for key, url in sources.items():
         destination = local(cfg[key])
         if destination.exists():
+            if not destination.is_file() or not destination.stat().st_size:
+                raise ValueError(f'Existing source is not a nonempty file: {destination}; move it aside before retrying')
             print(f'Reusing {destination}', flush=True)
             continue
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -501,13 +556,22 @@ def download_sources(cfg):
         print(f'DOWNLOAD {url} -> {destination}', flush=True)
         with urlopen(url, timeout=120) as response, temporary.open('wb') as handle:
             response_metadata = {'final_url': response.url,
-                                 'content_disposition': response.headers.get('Content-Disposition')}
+                                 'content_disposition': response.headers.get('Content-Disposition'),
+                                 'content_length': response.headers.get('Content-Length')}
             shutil.copyfileobj(response, handle, length=1024*1024)
+        size = temporary.stat().st_size
+        expected_size = response_metadata['content_length']
+        if not size or (expected_size is not None and size != int(expected_size)):
+            raise ValueError(f'Incomplete source download: {destination}; rerun --download-sources')
+        if key == 'gwas_catalog':
+            with zipfile.ZipFile(temporary) as archive:
+                catalog_member(archive)
         temporary.replace(destination)
         receipt = {'url': url, 'downloaded_utc': datetime.now(timezone.utc).isoformat(),
-                   **response_metadata, **identity(destination)}
+                   **response_metadata, **identity(destination), 'sha256': digest(destination)}
         destination.with_name(destination.name+'.download.json').write_text(json.dumps(receipt, indent=2)+'\n')
-    print('Sources staged. Record the actual Catalog release/build in config.json before submission.')
+    resolved = resolve_catalog_release(dict(cfg))
+    print('Sources staged. Catalog snapshot:', resolved['gwas_catalog_release'], flush=True)
 
 
 def submit(cfg, chroms, max_concurrent):
@@ -582,7 +646,10 @@ def main():
             parser.error('Downloads belong on the login node')
         download_sources(json.loads(local(args.config).read_text()))
         return
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except (ValueError, FileNotFoundError, zipfile.BadZipFile) as exc:
+        parser.error(str(exc))
     chroms = []
     for token in args.chromosomes.split(','):
         if not re.fullmatch(r'[0-9]+(?:-[0-9]+)?', token):

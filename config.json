@@ -3,7 +3,7 @@
   "output_dir": "output/v0.1.0",
   "hapmap3_plus": "data/map_hm3_plus.rds",
   "gwas_catalog": "data/gwas-catalog-associations.zip",
-  "gwas_catalog_release": "REPLACE_WITH_SNAPSHOT_DATE_AND_ENSEMBL_RELEASE",
+  "gwas_catalog_release": "auto",
   "gwas_catalog_build": "GRCh38",
   "gwas_p_threshold": 5e-8,
   "gnomad_release": "4.1",

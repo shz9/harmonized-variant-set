@@ -129,7 +129,7 @@ bash run.sh --setup-only
 # Login: download only the two discovery sources (also prepares Python dependencies).
 bash run.sh --download-sources
 
-# Edit config.json: actual Catalog snapshot/release, local references and output version.
+# Edit config.json: local references and output version (Catalog snapshot is automatic).
 # Stage the large resources listed below on shared storage before proceeding.
 
 # Login: lightweight validation only; never scan full reference files here.
@@ -157,9 +157,22 @@ jobs. It can be rerun to reuse the environment and install missing Python
 dependencies. `--check-only`
 does not install, download or submit. The download command reuses existing files;
 to update sources, stage new dated files and select a new panel version. The
-Catalog `latest` URL is a staging convenience: record the actual release date and
-Ensembl mapping release in `gwas_catalog_release` before submitting. A download
-timestamp alone is not the Catalog release. Prefer a
+Catalog snapshot is identified automatically from the staged file when
+`gwas_catalog_release` is `"auto"` (the default). Existing `REPLACE_...`
+placeholders, empty values and null also select automatic identification, so
+previously downloaded files work without editing that field or downloading again.
+When the filename or ZIP member includes the official `rYYYY-MM-DD` and `eNNN`
+tokens, the workflow records the release date and Ensembl version. Otherwise it
+records an exact `local-sha256:...` snapshot identity and marks the upstream
+release as unknown. It never infers a release from download time or today's
+`latest` release. This metadata is frozen into submission provenance and stage
+manifests; it does not rewrite your working configuration. An explicitly supplied
+release string is preserved.
+
+Identification runs offline during preflight. It reads ZIP directory metadata
+or, for generic filenames, hashes only the staged Catalog file; it does not scan
+the large reference VCFs/FASTAs. Download receipts also record source SHA256
+checksums, and empty or incomplete new downloads are rejected. Prefer a
 [dated Catalog release](https://ftp.ebi.ac.uk/pub/databases/gwas/releases/)
 when assembling a reproducible release.
 
@@ -191,9 +204,10 @@ After updating the repository, rerun `bash run.sh --setup-only`; an existing
 
 The submission consists of a candidates job, a chromosome array, and a merge
 job, linked by `afterok` dependencies. **Each job requests 1 CPU, 8 GiB and 5 hours**;
-Java is capped at 4 GiB. All parsing, normalization, indexed variant queries,
-liftover, source SHA256 calculations and merging run on compute nodes, without
-network access. `SLURM_TMPDIR` holds temporary files. The internal
+Java is capped at 4 GiB. Association parsing, normalization, indexed variant
+queries, liftover and merging run on compute nodes, without network access.
+Discovery-source checksums are also recorded during downloads and, when needed,
+Catalog snapshot identification on login. `SLURM_TMPDIR` holds temporary files. The internal
 `job.sbatch` contains the resource defaults; no LD is computed here.
 
 Before submission, stage these resources locally:
@@ -201,7 +215,7 @@ Before submission, stage these resources locally:
 | Resource | Requirements |
 | --- | --- |
 | HapMap3+ | Published `map_hm3_plus.rds`, or an equivalent TSV with `chr,pos,pos_hg38,rsid,a0,a1` |
-| GWAS Catalog | Full v1.0.2 curated associations ZIP containing a single TSV, or unpacked TSV; record its release/build |
+| GWAS Catalog | Full v1.0.2 curated associations ZIP containing a single TSV, or unpacked TSV; snapshot identified automatically; verify GRCh38 build |
 | gnomAD | Official **v4.1 genomes** per-chromosome sites VCFs plus `.tbi`/`.csi` indexes; no sample genotypes required |
 | dbSNP | GRCh38 sites VCF plus `.tbi`/`.csi`, staged locally or at an explicitly configured shared path |
 | GRCh38 / GRCh37 | Matching FASTAs with `chr1`…`chr22`, `.fai` and Picard `.dict` files |
@@ -228,8 +242,8 @@ gnomAD/dbSNP sources: indexed position queries precede normalization, so an
 arbitrarily padded, nonnormalized indel could otherwise be missed upstream.
 
 Configuration and workflow code are copied into `output_dir/provenance` before
-submission. Source hashes, configuration, code hashes, exclusion counts and
-ancestry selection counts are recorded in stage manifests. Existing submission
+submission. Source hashes, the resolved Catalog snapshot, configuration, code
+hashes, exclusion counts and ancestry selection counts are recorded in stage manifests. Existing submission
 provenance prevents duplicate submissions into the same version. Outputs appear
 atomically after each stage completes; failures retain `.partial` directories
 and logs. If a job fails, inspect `provenance/jobs.json` and the logs, cancel any

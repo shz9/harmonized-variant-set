@@ -1,4 +1,7 @@
+from contextlib import redirect_stdout
+import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -58,6 +61,192 @@ class PicardCommandTests(unittest.TestCase):
         for command in ([], 'picard', ['java', '-jar'], ['']):
             with self.subTest(command=command), self.assertRaises(ValueError):
                 hvs.picard_command({'picard_command': command})
+
+
+class PreparationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.root_patch = patch.object(hvs, 'ROOT', self.root)
+        self.root_patch.start()
+        self.addCleanup(self.root_patch.stop)
+        self.cfg = json.loads((MODULE.parent / 'config.json').read_text())
+        self.cfg['picard_command'] = ['picard']
+        self.config = self.root / 'config.json'
+        self.catalog = self.root / self.cfg['gwas_catalog']
+        self.catalog.parent.mkdir(parents=True)
+        self.save_config()
+
+    def save_config(self):
+        self.config.write_text(json.dumps(self.cfg))
+
+    def write_catalog(self, member='gwas_catalog_v1.0.2-associations_e114_r2026-10-30.tsv'):
+        with zipfile.ZipFile(self.catalog, 'w') as archive:
+            archive.writestr(member, 'P-VALUE\tCHR_ID\tCHR_POS\tSNP_ID_CURRENT\n')
+        return self.catalog
+
+    def test_auto_and_legacy_placeholders_resolve_existing_archive_offline(self):
+        self.write_catalog()
+        for release in ('auto', ' AUTO ', 'REPLACE_WITH_SNAPSHOT_DATE_AND_ENSEMBL_RELEASE', '', None):
+            with self.subTest(release=release), patch.object(hvs, 'urlopen') as network:
+                self.cfg['gwas_catalog_release'] = release
+                self.save_config()
+                loaded = hvs.load_config('config.json')
+                self.assertEqual(loaded['gwas_catalog_release'], 'GWAS Catalog r2026-10-30 e114')
+                self.assertEqual(loaded['gwas_catalog_snapshot']['identification'], 'versioned_filename')
+                self.assertEqual(json.loads(self.config.read_text())['gwas_catalog_release'], release)
+                network.assert_not_called()
+
+    def test_missing_release_field_also_uses_auto(self):
+        self.write_catalog()
+        del self.cfg['gwas_catalog_release']
+        self.save_config()
+        self.assertEqual(hvs.load_config('config.json')['gwas_catalog_release'], 'GWAS Catalog r2026-10-30 e114')
+
+    def test_generic_snapshot_has_stable_content_identity(self):
+        self.write_catalog('catalog.tsv')
+        first = hvs.load_config('config.json')
+        checksum = hashlib.sha256(self.catalog.read_bytes()).hexdigest()
+        self.assertEqual(first['gwas_catalog_release'], 'local-sha256:' + checksum)
+        self.assertEqual(first['gwas_catalog_snapshot']['upstream_release'], 'unknown')
+        self.assertEqual(hvs.load_config('config.json'), first)
+        self.write_catalog('different.tsv')
+        self.assertNotEqual(hvs.load_config('config.json')['gwas_catalog_release'], first['gwas_catalog_release'])
+
+    def test_uncompressed_versioned_filename(self):
+        catalog = self.root / 'gwas_catalog_e114_r2026-10-30.tsv'
+        catalog.write_text('header\n')
+        self.cfg['gwas_catalog'] = str(catalog)
+        self.save_config()
+        self.assertEqual(hvs.load_config('config.json')['gwas_catalog_release'], 'GWAS Catalog r2026-10-30 e114')
+
+    def test_explicit_release_and_frozen_snapshot_are_preserved(self):
+        self.write_catalog()
+        resolved = hvs.load_config('config.json')
+        self.config.write_text(json.dumps(resolved))
+        with patch.object(hvs, 'catalog_snapshot', side_effect=AssertionError('Must use frozen metadata')):
+            self.assertEqual(hvs.load_config('config.json'), resolved)
+        self.cfg['gwas_catalog_release'] = 'manually verified Catalog snapshot'
+        self.save_config()
+        self.assertEqual(hvs.load_config('config.json')['gwas_catalog_release'], self.cfg['gwas_catalog_release'])
+
+    def test_missing_empty_and_invalid_release_configuration(self):
+        with self.assertRaisesRegex(FileNotFoundError, '--download-sources'):
+            hvs.load_config('config.json')
+        self.catalog.touch()
+        with self.assertRaisesRegex(FileNotFoundError, 'empty'):
+            hvs.load_config('config.json')
+        self.cfg['gwas_catalog_release'] = 123
+        self.save_config()
+        with self.assertRaisesRegex(ValueError, 'must be a string'):
+            hvs.load_config('config.json')
+
+    def test_split_corrupt_and_empty_archives_fail_early(self):
+        self.write_catalog()
+        with zipfile.ZipFile(self.catalog, 'a') as archive:
+            archive.writestr('another.tsv', 'header\n')
+        with self.assertRaisesRegex(ValueError, 'single full Catalog'):
+            hvs.load_config('config.json')
+        self.catalog.write_bytes(b'not a ZIP archive')
+        with self.assertRaises(zipfile.BadZipFile):
+            hvs.load_config('config.json')
+        with zipfile.ZipFile(self.catalog, 'w') as archive:
+            archive.writestr('catalog.tsv', '')
+        with self.assertRaisesRegex(ValueError, 'empty table'):
+            hvs.load_config('config.json')
+
+    def test_conflicting_release_metadata_is_rejected(self):
+        self.catalog = self.catalog.with_name('catalog_r2026-10-01.zip')
+        self.cfg['gwas_catalog'] = str(self.catalog)
+        self.save_config()
+        self.write_catalog()
+        with self.assertRaisesRegex(ValueError, 'Conflicting'):
+            hvs.load_config('config.json')
+
+    def test_download_reuses_existing_sources_without_network_or_receipt(self):
+        self.write_catalog()
+        (self.root / self.cfg['hapmap3_plus']).write_bytes(b'existing RDS')
+        with patch.object(hvs, 'urlopen') as network, redirect_stdout(io.StringIO()) as output:
+            hvs.download_sources(self.cfg)
+        network.assert_not_called()
+        self.assertIn('GWAS Catalog r2026-10-30 e114', output.getvalue())
+
+    def response(self, payload, length=None):
+        response = io.BytesIO(payload)
+        response.url = 'https://example.test/releases/latest/catalog.zip'
+        response.headers = {} if length is None else {'Content-Length': str(length)}
+        return response
+
+    def test_new_download_records_checksum_and_is_reusable(self):
+        self.write_catalog()
+        payload = self.catalog.read_bytes()
+        self.catalog.unlink()
+        (self.root / self.cfg['hapmap3_plus']).write_bytes(b'existing RDS')
+        with patch.object(hvs, 'urlopen', return_value=self.response(payload, len(payload))) as network:
+            with redirect_stdout(io.StringIO()):
+                hvs.download_sources(self.cfg)
+        network.assert_called_once()
+        self.assertEqual(self.catalog.read_bytes(), payload)
+        receipt = json.loads(self.catalog.with_name(self.catalog.name + '.download.json').read_text())
+        self.assertEqual(receipt['sha256'], hashlib.sha256(payload).hexdigest())
+        self.assertEqual(hvs.load_config('config.json')['gwas_catalog_release'], 'GWAS Catalog r2026-10-30 e114')
+
+    def test_failed_download_is_not_promoted_to_completed_source(self):
+        (self.root / self.cfg['hapmap3_plus']).write_bytes(b'existing RDS')
+        empty_archive = io.BytesIO()
+        with zipfile.ZipFile(empty_archive, 'w') as archive:
+            archive.writestr('catalog.tsv', '')
+        for payload, length, error in ((b'', None, ValueError), (b'truncated', 100, ValueError),
+                                       (b'not a zip', None, zipfile.BadZipFile),
+                                       (empty_archive.getvalue(), None, ValueError)):
+            with self.subTest(payload=payload):
+                with patch.object(hvs, 'urlopen', return_value=self.response(payload, length)):
+                    with redirect_stdout(io.StringIO()), self.assertRaises(error):
+                        hvs.download_sources(self.cfg)
+                self.assertFalse(self.catalog.exists())
+                self.assertFalse(self.catalog.with_name(self.catalog.name + '.download.json').exists())
+
+    def test_existing_empty_source_is_not_silently_reused(self):
+        (self.root / self.cfg['hapmap3_plus']).touch()
+        with patch.object(hvs, 'urlopen') as network:
+            with self.assertRaisesRegex(ValueError, 'nonempty file'):
+                hvs.download_sources(self.cfg)
+        network.assert_not_called()
+
+    def test_preflight_and_submission_freeze_resolved_snapshot(self):
+        self.write_catalog('catalog.tsv')
+        for key in ('hapmap3_plus', 'dbsnp_vcf', 'reference_grch38', 'reference_grch37',
+                    'chain_38_to_37', 'chain_37_to_38'):
+            resource = self.root / self.cfg[key]
+            resource.parent.mkdir(parents=True, exist_ok=True)
+            resource.write_text('fixture\n')
+        for key, length in (('reference_grch38', 248956422), ('reference_grch37', 249250621)):
+            reference = self.root / self.cfg[key]
+            Path(str(reference) + '.fai').write_text(f'chr1\t{length}\nchr22\t1000\n')
+            reference.with_suffix('.dict').write_text('fixture dictionary\n')
+        for filename in (self.cfg['dbsnp_vcf'], self.cfg['gnomad_vcf'].format(chrom=22)):
+            resource = self.root / filename
+            resource.parent.mkdir(parents=True, exist_ok=True)
+            resource.write_text('fixture VCF\n')
+            Path(str(resource) + '.tbi').write_text('fixture index\n')
+        with patch.object(hvs.shutil, 'which', return_value='/bin/mock-tool'):
+            with patch.object(hvs.subprocess, 'check_output', return_value='bcftools fixture'):
+                with patch('sys.argv', ['workflow.py', '--check-only', '--chromosomes', '22']):
+                    with redirect_stdout(io.StringIO()) as output:
+                        hvs.main()
+            preflight = json.loads(output.getvalue())
+            self.assertTrue(preflight['config']['gwas_catalog_release'].startswith('local-sha256:'))
+            self.assertFalse((self.root / self.cfg['output_dir']).exists())
+            cfg = hvs.load_config('config.json')
+            with patch.object(hvs.subprocess, 'check_output', side_effect=['bcftools fixture', '101', '102', '103']):
+                with redirect_stdout(io.StringIO()):
+                    hvs.submit(cfg, [22], 1)
+        provenance = self.root / self.cfg['output_dir'] / 'provenance'
+        frozen = json.loads((provenance / 'config.json').read_text())
+        self.assertEqual(frozen['gwas_catalog_snapshot'], cfg['gwas_catalog_snapshot'])
+        self.assertEqual(frozen['gwas_catalog_release'], cfg['gwas_catalog_release'])
+        self.assertEqual(json.loads(self.config.read_text())['gwas_catalog_release'], 'auto')
 
 
 class FrequencyTests(unittest.TestCase):
