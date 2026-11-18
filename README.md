@@ -123,7 +123,10 @@ that LD can be estimated accurately from a small ancestry sample.
 Run these commands from this project's root (the directory containing `run.sh`):
 
 ```bash
-# Login: create the environment and download only the two discovery sources.
+# Login: create the environment and install/check dependencies; no data or jobs.
+bash run.sh --setup-only
+
+# Login: download only the two discovery sources (also prepares Python dependencies).
 bash run.sh --download-sources
 
 # Edit config.json: actual Catalog snapshot/release, local references and output version.
@@ -147,7 +150,11 @@ to reuse an independently staged shared copy. The project-local `.gitignore`
 excludes reference data, environments, intermediate outputs, logs and Python
 caches. Final merged variant sets and their manifest remain available to Git.
 
-Environment creation and downloads run on login. `--check-only`
+Environment creation and downloads run on login. `--setup-only` installs the
+Python dependencies and checks that bcftools, the configured Picard executable
+and SLURM sbatch are available, without requiring reference data or submitting
+jobs. It can be rerun to reuse the environment and install missing Python
+dependencies. `--check-only`
 does not install, download or submit. The download command reuses existing files;
 to update sources, stage new dated files and select a new panel version. The
 Catalog `latest` URL is a staging convenience: record the actual release date and
@@ -162,6 +169,19 @@ available, and creates its own `env/harmonized` environment. Override
 set `HVS_TOOL_MODULES="bcftools"` and configure `picard_command` as
 `["java", "-jar", "/shared/software/picard.jar"]` if Picard is installed as a JAR.
 Set `HVS_TOOL_MODULES=""` when both executables are already on PATH.
+Python 3.11+, its venv support, SLURM and the configured tool modules must be
+provided by the cluster; setup does not install system software. Picard JARs
+configured with `java -jar` must also be staged at the configured path.
+
+Setup updates pip before installing dependencies, prefers prebuilt wheels, and
+allows `pyreadr` to build from source when no compatible wheel is available.
+A source build needs a C compiler, Python headers and zlib, bzip2 and lzma
+development headers supplied by the cluster (load the appropriate compiler and
+library modules). NumPy, pandas and pysam still require wheels.
+If `pyreadr` reports "No matching distribution found", also check whether your
+configured package index contains it; setup uses your existing pip index settings.
+After updating the repository, rerun `bash run.sh --setup-only`; an existing
+`env/harmonized` can be reused.
 
 The submission consists of a candidates job, a chromosome array, and a merge
 job, linked by `afterok` dependencies. **Each job requests 1 CPU, 8 GiB and 5 hours**;
@@ -293,7 +313,8 @@ optional dense extensions, retaining stable identities across versions.
 
 ```bash
 python3 -m venv env/harmonized
-env/harmonized/bin/python -m pip install --only-binary=:all: -r requirements.txt
+env/harmonized/bin/python -m pip install --upgrade pip
+env/harmonized/bin/python -m pip install --prefer-binary --only-binary=numpy,pandas,pysam -r requirements.txt
 env/harmonized/bin/python -m unittest discover -s tests -v
 bash -n run.sh job.sbatch
 ```
