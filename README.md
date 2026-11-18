@@ -165,10 +165,16 @@ when assembling a reproducible release.
 
 The entry point loads `python/3.13`, `bcftools` and `picard` through modules when
 available, and creates its own `env/harmonized` environment. Override
-`PYTHON_MODULE` and `HVS_TOOL_MODULES` consistently for your cluster. For example,
-set `HVS_TOOL_MODULES="bcftools"` and configure `picard_command` as
-`["java", "-jar", "/shared/software/picard.jar"]` if Picard is installed as a JAR.
-Set `HVS_TOOL_MODULES=""` when both executables are already on PATH.
+`PYTHON_MODULE` and `HVS_TOOL_MODULES` consistently for your cluster.
+The default `picard_command` is `["java", "-jar", "$EBROOTPICARD/picard.jar"]`,
+matching the EasyBuild Picard module. Both the launcher and SLURM jobs load the
+module before reading the configuration. The workflow expands `EBROOTPICARD`,
+checks that the JAR exists, and records the resolved command in provenance.
+No separate Picard download is needed.
+
+For a different installation, set `picard_command` to `["picard"]` for a wrapper
+on PATH, or `["java", "-jar", "/shared/software/picard.jar"]` for a fixed JAR path.
+Set `HVS_TOOL_MODULES=""` when the tools and Java are already available on PATH.
 Python 3.11+, its venv support, SLURM and the configured tool modules must be
 provided by the cluster; setup does not install system software. Picard JARs
 configured with `java -jar` must also be staged at the configured path.

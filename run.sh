@@ -83,9 +83,8 @@ for index, arg in enumerate(args):
         config = Path(args[index + 1]).expanduser()
     elif arg.startswith('--config='):
         config = Path(arg.split('=', 1)[1]).expanduser()
-command = json.loads(config.read_text())['picard_command']
-if not isinstance(command, list) or not command or not all(isinstance(x, str) and x for x in command):
-    raise SystemExit('picard_command must be a nonempty argument list')
+from workflow import picard_command
+command = picard_command(json.loads(config.read_text()))
 for tool in ('bcftools', command[0], 'sbatch'):
     if not shutil.which(tool):
         raise SystemExit(f'Missing executable: {tool}. Load its cluster module or add it to PATH, then rerun setup.')

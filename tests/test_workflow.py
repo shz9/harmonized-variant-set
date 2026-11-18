@@ -31,6 +31,35 @@ class StandaloneTests(unittest.TestCase):
                     self.assertTrue(hvs.local(cfg[key]).is_relative_to(project))
 
 
+class PicardCommandTests(unittest.TestCase):
+    def test_easybuild_jar_expansion_and_execution(self):
+        with tempfile.TemporaryDirectory(prefix='picard module ') as tmp:
+            jar = (Path(tmp) / 'picard.jar').resolve()
+            jar.write_bytes(b'test jar')
+            cfg = {'picard_command': ['java', '-jar', '$EBROOTPICARD/picard.jar']}
+            with patch.dict(os.environ, {'EBROOTPICARD': tmp}), patch.object(hvs, 'run') as run:
+                self.assertEqual(hvs.picard_command(cfg), ['java', '-jar', str(jar)])
+                hvs.liftover(cfg, 'in.vcf', 'out.vcf', 'chain', 'ref.fa', 'reject.vcf')
+            self.assertEqual(run.call_args.args[:4], ('java', '-jar', str(jar), 'LiftoverVcf'))
+            self.assertEqual(cfg['picard_command'][-1], '$EBROOTPICARD/picard.jar')
+
+    def test_missing_module_variable_has_actionable_error(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, 'load the picard module'):
+                hvs.picard_command({'picard_command': ['java', '-jar', '$EBROOTPICARD/picard.jar']})
+
+    def test_missing_jar_fails_before_java_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(FileNotFoundError, 'Picard JAR'):
+                hvs.picard_command({'picard_command': ['java', '-jar', str(Path(tmp) / 'missing.jar')]})
+
+    def test_wrapper_and_malformed_commands(self):
+        self.assertEqual(hvs.picard_command({'picard_command': ['picard']}), ['picard'])
+        for command in ([], 'picard', ['java', '-jar'], ['']):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                hvs.picard_command({'picard_command': command})
+
+
 class FrequencyTests(unittest.TestCase):
     def test_strict_minor_count_and_frequency(self):
         cases = [(20, 1000, 'below_maf_or_mac'), (21, 4200, 'below_maf_or_mac'),

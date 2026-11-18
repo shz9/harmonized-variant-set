@@ -58,11 +58,29 @@ def run(*args):
     subprocess.run(list(map(str, args)), check=True)
 
 
+
+def picard_command(cfg):
+    """Resolve module environment variables without invoking a shell."""
+    command = cfg['picard_command']
+    if not isinstance(command, list) or not command or not all(
+            isinstance(x, str) and x for x in command):
+        raise ValueError('picard_command must be a nonempty argument list')
+    command = [os.path.expandvars(os.path.expanduser(arg)) for arg in command]
+    if any(re.search(r'\$(?:[A-Za-z_]|\{)', arg) for arg in command):
+        raise ValueError('Unresolved variable in picard_command; load the picard module to set EBROOTPICARD')
+    if '-jar' in command:
+        index = command.index('-jar') + 1
+        if index == len(command):
+            raise ValueError('picard_command requires a JAR path after -jar')
+        jar = local(command[index])
+        if not jar.is_file() or not jar.stat().st_size:
+            raise FileNotFoundError(f'Picard JAR not found or empty: {jar}; check the picard module/path')
+        command[index] = str(jar)
+    return command
+
 def load_config(filename):
     cfg = json.loads(local(filename).read_text())
-    if not isinstance(cfg['picard_command'], list) or not cfg['picard_command'] or not all(
-            isinstance(x, str) and x for x in cfg['picard_command']):
-        raise ValueError('picard_command must be a nonempty argument list')
+    cfg['picard_command'] = picard_command(cfg)
     if cfg['gwas_catalog_build'] != 'GRCh38' or cfg['gnomad_data_type'] != 'genomes':
         raise ValueError('Initial workflow requires GRCh38 Catalog mappings and gnomAD genomes')
     if cfg['gnomad_release'] != '4.1':
@@ -317,7 +335,7 @@ def build37_export(selected):
 
 
 def liftover(cfg, source, destination, chain, reference, rejects):
-    run(*cfg['picard_command'], 'LiftoverVcf', f'I={source}', f'O={destination}',
+    run(*picard_command(cfg), 'LiftoverVcf', f'I={source}', f'O={destination}',
         f'CHAIN={chain}', f'R={reference}', f'REJECT={rejects}',
         'RECOVER_SWAPPED_REF_ALT=true', 'CREATE_INDEX=false', 'WARN_ON_MISSING_CONTIG=true')
 
@@ -448,7 +466,10 @@ def check_inputs(cfg, chroms):
     missing += missing_indexes
     if missing:
         raise FileNotFoundError('Stage these local resources/indexes before submitting:\n'+'\n'.join(missing))
-    for tool in ('bcftools', cfg['picard_command'][0]):
+    command = picard_command(cfg)
+    if '-jar' in command:
+        required.append(Path(command[command.index('-jar') + 1]))
+    for tool in ('bcftools', command[0]):
         if not shutil.which(tool):
             raise FileNotFoundError(f'Missing executable: {tool}')
     # Inspect small FASTA indexes, never the multi-GB FASTAs themselves on login.
@@ -461,7 +482,7 @@ def check_inputs(cfg, chroms):
             'code_sha256': digest(Path(__file__)),
             'packages': {p: version(p) for p in ('pandas', 'numpy', 'pysam', 'pyreadr')},
             'bcftools_version': subprocess.check_output(['bcftools', '--version'], text=True).strip(),
-            'picard_command': cfg['picard_command']}
+            'picard_command': command}
 
 
 def download_sources(cfg):
