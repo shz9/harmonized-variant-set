@@ -31,7 +31,7 @@ class FakeSlurm:
                 for task, state in job['tasks'].items():
                     if state in ('PENDING', 'RUNNING', 'COMPLETING'):
                         jobid = root if task is None else f'{root}_{task}'
-                        rows.append(f'{jobid}|{state}|{job["comment"]}|{job.get("reason", "Priority")}')
+                        rows.append(f'{jobid}|{state}|{job["comment"]}|{job.get("reason", "Priority")}|{job.get("limits", {}).get(task, job.get("wall_time", "01:00:00"))}')
             return '\n'.join(rows)
         if command[0] == 'sacct':
             roots = command[command.index('--jobs') + 1].split(',')
@@ -56,6 +56,14 @@ class FakeSlurm:
         return root + ';cluster\n'
 
     def run(self, command, **kwargs):
+        if command[0] == 'scontrol':
+            fields = dict(item.split('=', 1) for item in command[2:])
+            root, _, task = fields['JobId'].partition('_')
+            record = self.jobs[root]
+            selected = [int(task)] if task else list(record['tasks'])
+            for c in selected:
+                record.setdefault('limits', {})[c] = fields['TimeLimit']
+            return subprocess.CompletedProcess(command, 0)
         if command[0] != 'scancel':
             raise AssertionError(command)
         jobid = command[1]
@@ -84,6 +92,7 @@ class ResumeTests(unittest.TestCase):
         for context in (patch.object(hvs, 'ROOT', self.root),
                         patch.object(hvs.shutil, 'which', return_value='/mock/tool'),
                         patch.object(hvs, 'check_inputs', side_effect=self.inputs),
+                        patch.object(hvs, 'staged_chromosomes', side_effect=lambda cfg, chroms: set(chroms)),
                         patch.object(hvs.subprocess, 'check_output', side_effect=self.backend.output),
                         patch.object(hvs.subprocess, 'run', side_effect=self.backend.run),
                         patch.object(hvs, 'sleep')):
@@ -100,9 +109,9 @@ class ResumeTests(unittest.TestCase):
             raise FileNotFoundError('FASTA indexes are missing')
         return {'config': cfg, 'inputs': []}
 
-    def launch(self):
+    def launch(self, max_concurrent=2):
         with redirect_stdout(io.StringIO()):
-            hvs.submit(self.cfg, self.chroms, 2)
+            return hvs.submit(self.cfg, self.chroms, max_concurrent)
 
     def complete(self, stage):
         path = self.output / stage
@@ -172,7 +181,7 @@ class ResumeTests(unittest.TestCase):
 
     def test_completed_stages_and_failed_array_elements_resume_independently(self):
         self.chroms = [20, 21, 22]
-        self.launch()
+        self.launch(3)
         self.complete('candidates')
         self.complete('chr_20')
         self.backend.jobs['101']['tasks'][None] = 'COMPLETED'
@@ -254,7 +263,7 @@ class ResumeTests(unittest.TestCase):
         (self.root / 'config.json').write_text(json.dumps(self.cfg))
         with patch.object(hvs, 'load_config', return_value=dict(self.cfg)):
             with patch.object(hvs, 'download_sources'), patch.object(hvs, 'download_references'):
-                with patch.object(hvs, 'submit') as plan:
+                with patch.object(hvs, 'start_controller') as plan:
                     with patch('sys.argv', ['workflow.py', '--account', 'def-liyue']):
                         hvs.main()
         self.assertEqual(plan.call_args.args[1], [22])
@@ -280,6 +289,122 @@ class ResumeTests(unittest.TestCase):
                 hvs.execute_stage(self.cfg, 'candidates', None, self.chroms)
         self.assertTrue(hvs.stage_complete(self.output, 'candidates', self.cfg, self.chroms))
         self.assertEqual(len(list((self.output / 'recovery').glob('candidates.*/unfinished.txt'))), 1)
+
+    def test_every_new_job_uses_one_hour_default(self):
+        self.ready = False
+        self.launch()
+        self.assertEqual(len(self.backend.jobs), 4)
+        for command in self.backend.commands:
+            self.assertIn('--time=01:00:00', command)
+
+    def test_pending_long_jobs_are_shortened_without_resubmission(self):
+        self.launch()
+        for job in self.backend.jobs.values():
+            job['wall_time'] = '2-00:00:00'
+        count = len(self.backend.commands)
+        self.launch()
+        self.assertEqual(len(self.backend.commands), count)
+        for job in self.backend.jobs.values():
+            self.assertEqual(set(job['limits'].values()), {'01:00:00'})
+
+    def test_running_array_task_keeps_limit_while_pending_task_is_shortened(self):
+        self.launch()
+        job = self.backend.jobs['102']
+        job['wall_time'] = '2-00:00:00'
+        job['tasks'][21] = 'RUNNING'
+        self.launch()
+        self.assertEqual(job['limits'], {22: '01:00:00'})
+
+    def test_custom_wall_time_is_operational_and_validated(self):
+        self.launch()
+        self.cfg['wall_time'] = '00:30:00'
+        self.backend.jobs['101']['tasks'][None] = 'FAILED'
+        for root in ('102', '103'):
+            self.backend.jobs[root]['reason'] = 'DependencyNeverSatisfied'
+        self.launch()
+        self.assertIn('--time=00:30:00', self.backend.by_stage('candidates')[-1][1]['command'])
+        for value in ('00:00:00', '1:99:00', '48 hours', 3600):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                hvs.wall_time(value)
+
+    def test_jobs_are_not_submitted_until_local_vcfs_are_staged(self):
+        with patch.object(hvs, 'staged_chromosomes', return_value=set()):
+            progress = self.launch()
+        self.assertEqual(len(self.backend.jobs), 1)
+        self.assertEqual(progress['unstaged'], [21, 22])
+        self.assertFalse(self.backend.by_stage('chromosome'))
+        self.assertFalse(self.backend.by_stage('merge'))
+        with patch.object(hvs, 'staged_chromosomes', return_value={21}):
+            self.launch(1)
+        self.assertIn('--array=21%1', self.backend.by_stage('chromosome')[-1][1]['command'])
+        with patch.object(hvs, 'staged_chromosomes', return_value={21, 22}):
+            self.launch(1)
+        self.assertEqual(len(self.backend.by_stage('chromosome')), 1)
+
+    def test_legacy_network_workers_are_cancelled_and_replaced(self):
+        self.launch()
+        for root in ('102', '103'):
+            self.backend.jobs[root]['comment'] = self.backend.jobs[root]['comment'].split('@')[0]
+        self.launch()
+        self.assertEqual(set(self.backend.cancellations), {'102', '103'})
+        self.assertEqual(len(self.backend.by_stage('candidates')), 1)
+        self.assertIn('@offline-v1', self.backend.by_stage('chromosome')[-1][1]['comment'])
+
+    def test_download_helpers_are_forbidden_in_compute_jobs(self):
+        target = self.root / 'never-downloaded.gz'
+        operations = [lambda: hvs.parallel_download('http://example.test/data', target),
+                      lambda: hvs.download_reference('http://example.test/data', target),
+                      lambda: hvs.download_source('hapmap3_plus', target, ('http://example.test/data',)),
+                      lambda: hvs.download_sources({}), lambda: hvs.download_references({}, [21]),
+                      lambda: hvs.stage_gnomad({}, 21)]
+        with patch.dict(hvs.os.environ, {'SLURM_JOB_ID': '123'}):
+            with patch.object(hvs, 'urlopen') as http:
+                for operation in operations:
+                    with self.assertRaisesRegex(RuntimeError, 'forbidden'):
+                        operation()
+                http.assert_not_called()
+
+    def test_login_controller_refills_only_available_slots(self):
+        progress = [
+            {'complete': False, 'done_chroms': [], 'active_chroms': [21], 'unstaged': [22, 23]},
+            {'complete': False, 'done_chroms': [], 'active_chroms': [21, 22], 'unstaged': [23]},
+            {'complete': False, 'done_chroms': [21], 'active_chroms': [22], 'unstaged': [23]},
+            {'complete': False, 'done_chroms': [21], 'active_chroms': [22, 23], 'unstaged': []},
+            {'complete': True, 'done_chroms': [21, 22, 23], 'active_chroms': [], 'unstaged': []}]
+        with patch.object(hvs, 'submit', side_effect=progress):
+            with patch.object(hvs, 'stage_gnomad') as stage:
+                hvs.coordinate(self.cfg, [21, 22, 23], 2)
+        self.assertEqual([call.args[1] for call in stage.call_args_list], [22, 23])
+        self.assertEqual(json.loads((self.provenance / 'controller.json').read_text())['state'], 'completed')
+
+    def test_login_controller_waits_when_scratch_window_is_full(self):
+        progress = [{'complete': False, 'done_chroms': [], 'active_chroms': [21, 22], 'unstaged': [23]},
+                    {'complete': True, 'done_chroms': [21, 22, 23], 'active_chroms': [], 'unstaged': []}]
+        with patch.object(hvs, 'submit', side_effect=progress):
+            with patch.object(hvs, 'stage_gnomad') as stage, patch.object(hvs, 'sleep') as pause:
+                hvs.coordinate(self.cfg, [21, 22, 23], 2)
+        stage.assert_not_called()
+        pause.assert_called_once_with(30)
+
+    def test_controller_records_failure_and_stops_instead_of_retrying_forever(self):
+        with patch.object(hvs, 'submit', side_effect=ValueError('worker failed')):
+            with self.assertRaisesRegex(ValueError, 'worker failed'):
+                hvs.coordinate(self.cfg, self.chroms, 2)
+        state = json.loads((self.provenance / 'controller.json').read_text())
+        self.assertEqual(state['state'], 'failed')
+        self.assertIn('worker failed', state['error'])
+
+    def test_failed_new_attempt_is_not_resubmitted_repeatedly_by_controller(self):
+        baseline = {}
+        with redirect_stdout(io.StringIO()):
+            hvs.submit(self.cfg, self.chroms, 2, retry_baseline=baseline)
+        self.backend.jobs['101']['tasks'][None] = 'FAILED'
+        for root in ('102', '103'):
+            self.backend.jobs[root]['reason'] = 'DependencyNeverSatisfied'
+        count = len(self.backend.commands)
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, 'stopping rather than repeatedly'):
+            hvs.submit(self.cfg, self.chroms, 2, retry_baseline=baseline)
+        self.assertEqual(len(self.backend.commands), count)
 
     def test_scientific_changes_are_rejected_without_modifying_results(self):
         self.launch()

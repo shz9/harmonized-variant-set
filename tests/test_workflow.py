@@ -77,6 +77,9 @@ class PreparationTests(unittest.TestCase):
         pause = patch.object(hvs, 'sleep')
         pause.start()
         self.addCleanup(pause.stop)
+        staging = patch.object(hvs, 'staged_chromosomes', side_effect=lambda cfg, chroms: set(chroms))
+        staging.start()
+        self.addCleanup(staging.stop)
         scheduler = patch.object(hvs, 'scheduler_jobs', return_value=[])
         scheduler.start()
         self.addCleanup(scheduler.stop)
@@ -232,7 +235,7 @@ class PreparationTests(unittest.TestCase):
             self.write_catalog()
             (self.root / cfg['hapmap3_plus']).write_bytes(b'existing RDS')
         with patch.object(hvs, 'download_sources', side_effect=stage) as download:
-            with patch.object(hvs, 'submit') as submit, patch.object(hvs, 'download_references'):
+            with patch.object(hvs, 'start_controller') as submit, patch.object(hvs, 'download_references'):
                 with patch('sys.argv', ['workflow.py', '--chromosomes', '22']):
                     hvs.main()
         download.assert_called_once()
@@ -546,6 +549,7 @@ class SubmissionTests(unittest.TestCase):
             with patch.object(hvs, 'ROOT', Path(tmp)), patch.object(hvs, 'check_inputs', return_value={}), \
                     patch.object(hvs.shutil, 'which', return_value='/bin/sbatch'), \
                     patch.object(hvs, 'scheduler_jobs', return_value=[]), \
+                    patch.object(hvs, 'staged_chromosomes', side_effect=lambda cfg, chroms: set(chroms)), \
                     patch.object(hvs.subprocess, 'check_output', side_effect=['101\n', '102;cluster\n', '103\n']) as submit:
                 hvs.submit(cfg, [21, 22], 2)
                 calls = [c.args[0] for c in submit.call_args_list]
@@ -557,7 +561,7 @@ class SubmissionTests(unittest.TestCase):
                 self.assertEqual(json.loads((provenance/'config.json').read_text()), cfg)
                 self.assertEqual((provenance/'workflow.py').read_bytes(), MODULE.read_bytes())
                 active = [{'id': job, 'root': job.split('_')[0], 'stage': stage,
-                           'state': 'PENDING', 'reason': 'Priority'} for stage, job in
+                           'state': 'PENDING', 'reason': 'Priority', 'protocol': 'offline-v1'} for stage, job in
                           [('candidates', '101'), ('chromosome', '102_21'), ('chromosome', '102_22'), ('merge', '103')]]
                 with patch.object(hvs, 'scheduler_jobs', return_value=active):
                     hvs.submit(cfg, [21, 22], 2)

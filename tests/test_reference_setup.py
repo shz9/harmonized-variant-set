@@ -140,61 +140,65 @@ class ReferenceSetupTests(unittest.TestCase):
             self.assertEqual(command[0], 'sbatch')
             jobs.append(command)
             return str(100 + len(jobs))
+        def worker(stage, frozen, fail_once=False):
+            args = ['workflow.py', '--config', str(frozen), '--stage', stage, '--chromosomes', '22']
+            if stage == 'chromosome':
+                args += ['--chrom', '22']
+            with patch.dict(os.environ, {'SLURM_JOB_ID': '123', 'SLURM_TMPDIR': str(self.root)}):
+                with patch.object(hvs, 'urlopen', side_effect=AssertionError('HTTP forbidden on compute node')):
+                    with patch.object(hvs, 'parallel_download', side_effect=AssertionError('Download forbidden on compute node')):
+                        with patch.object(hvs, 'download_reference', side_effect=AssertionError('curl forbidden on compute node')):
+                            with patch('sys.argv', args), redirect_stdout(io.StringIO()):
+                                if fail_once:
+                                    with patch.object(hvs, 'candidate_counts', side_effect=ValueError('interrupted extraction')):
+                                        with self.assertRaisesRegex(ValueError, 'interrupted extraction'):
+                                            hvs.main()
+                                hvs.main()
         with patch.object(hvs, 'urlopen', side_effect=self.stage_discovery_request):
             with patch.object(hvs.shutil, 'which', return_value='/mock/tool'):
                 with patch.object(hvs.subprocess, 'check_output', side_effect=external):
                     with patch.object(hvs, 'REFERENCE_CHR1_LENGTHS', {'reference_grch38': 10, 'reference_grch37': 10}):
                         with patch.object(hvs, 'run', side_effect=self.native_tools):
-                            with patch('sys.argv', ['workflow.py', '--config', str(self.config), '--chromosomes', '22']):
-                                with redirect_stdout(io.StringIO()):
-                                    hvs.main()
-                            self.assertEqual(len(jobs), 4)
-                            self.assertIn('--time=48:00:00', jobs[0])
-                            for index in range(1, 4):
-                                dep = next(x for x in jobs[index] if x.startswith('--dependency='))
-                                self.assertIn(str(100 + index), dep.split(':')[1:])
+                            # Execute controller cycles in-process so worker completions can be simulated.
+                            with patch.object(hvs, 'start_controller', side_effect=hvs.submit):
+                                with patch('sys.argv', ['workflow.py', '--config', str(self.config), '--chromosomes', '22']):
+                                    with redirect_stdout(io.StringIO()):
+                                        hvs.main()
+                            self.assertEqual(len(jobs), 2)  # Only prepare and candidates: no VCF staged yet.
+                            self.assertNotIn('/chr22.bgz', [name for name, _ in self.requests])
                             output = self.project / self.cfg['output_dir']
                             provenance = output / 'provenance'
-                            self.assertTrue(json.loads((provenance / 'preflight.json').read_text())['pending_reference_preparation'])
-                            # Exercise building indexes for independently staged VCFs too.
-                            for key in ('dbsnp_vcf',):
-                                Path(str(hvs.local(self.cfg[key].format(chrom=22))) + '.tbi').unlink()
-                            for stage in ('prepare', 'candidates', 'chromosome', 'merge'):
-                                args = ['workflow.py', '--config', str(provenance / 'config.json'), '--stage', stage,
-                                        '--chromosomes', '22']
-                                if stage == 'chromosome':
-                                    args += ['--chrom', '22']
-                                with patch.dict(os.environ, {'SLURM_JOB_ID': '123', 'SLURM_TMPDIR': str(self.root)}):
-                                    with patch('sys.argv', args), redirect_stdout(io.StringIO()):
-                                        if stage == 'chromosome':
-                                            with patch.object(hvs, 'parallel_download', side_effect=ValueError('interrupted transfer')):
-                                                with self.assertRaisesRegex(ValueError, 'interrupted transfer'):
-                                                    hvs.main()
-                                        # Same allocation/job ID, matching a SLURM requeue.
-                                        hvs.main()
-                            # A second launcher call after completion is a no-op.
+                            frozen = provenance / 'config.json'
+                            cfg = json.loads(frozen.read_text())
+                            Path(str(hvs.local(cfg['dbsnp_vcf'])) + '.tbi').unlink()
+                            worker('prepare', frozen)
+                            worker('candidates', frozen)
+                            # This transfer is explicitly outside the SLURM environment.
+                            with redirect_stdout(io.StringIO()):
+                                hvs.stage_gnomad(cfg, 22)
+                                hvs.submit(cfg, [22], 2)
+                            self.assertEqual(len(jobs), 4)
+                            self.assertIn('--dependency=afterok:101', jobs[1])
+                            self.assertIn('--dependency=afterok:103', jobs[3])
+                            worker('chromosome', frozen, fail_once=True)
+                            worker('merge', frozen)
                             count = len(self.requests)
                             submitted = len(jobs)
-                            with patch('sys.argv', ['workflow.py', '--config', str(self.config), '--chromosomes', '22']):
-                                with redirect_stdout(io.StringIO()):
-                                    hvs.main()
+                            with patch.object(hvs, 'start_controller', side_effect=hvs.submit):
+                                with patch('sys.argv', ['workflow.py', '--config', str(self.config), '--chromosomes', '22']):
+                                    with redirect_stdout(io.StringIO()):
+                                        hvs.main()
                             self.assertEqual(len(jobs), submitted)
-                            self.assertEqual(len(self.requests), count)
-                            # Existing resources are reused without another HTTP request.
-                            count = len(self.requests)
-                            hvs.download_references(self.cfg, [22])
                             self.assertEqual(len(self.requests), count)
         for build in ('GRCh38', 'GRCh37'):
             exported = pd.read_csv(output / 'merge' / f'EUR.{build}.tsv.gz', sep='\t')
             self.assertEqual(exported.VARIANT_KEY.tolist(), ['chr22:100:A:G'])
-        self.assertFalse(json.loads((provenance / 'preflight.json').read_text()).get('pending_reference_preparation'))
         counts = output / 'gnomad_counts' / 'chr_22' / 'counts.tsv.gz'
         self.assertEqual(pd.read_csv(counts, sep='\t').AC_nfe.tolist(), [21])
-        self.assertFalse(list(Path(self.cfg['scratch_dir']).rglob('*.vcf.bgz')))
-        self.assertIn('--cpus-per-task=2', jobs[2])
+        self.assertFalse(list(Path(cfg['scratch_dir']).rglob('*.vcf.bgz')))
+        self.assertIn('--cpus-per-task=1', jobs[2])
         self.assertIn('--array=22%2', jobs[2])
-        self.assertTrue((output / 'merge' / 'manifest.json').exists())
-        self.assertEqual(len(hvs.input_inventory(self.cfg, [22])[1]), 0)
+        self.assertEqual(len(hvs.input_inventory(cfg, [22])[1]), 0)
         self.assertNotIn('/chr1.bgz', [name for name, _ in self.requests])
 
     def test_interrupted_reference_transfer_resumes_using_range(self):
@@ -272,6 +276,8 @@ class ReferenceSetupTests(unittest.TestCase):
         work = self.root / 'work'
         work.mkdir()
         output = self.project / self.cfg['output_dir']
+        with redirect_stdout(io.StringIO()):
+            hvs.stage_gnomad(self.cfg, 22)
         with patch.object(hvs, 'run', side_effect=self.native_tools):
             with patch.object(hvs, 'normalize', side_effect=ValueError('synthetic extraction failure')):
                 with self.assertRaisesRegex(ValueError, 'synthetic extraction failure'):

@@ -161,8 +161,10 @@ def load_config(filename):
             raise ValueError('Ancestry names must be uppercase; source groups must be distinct')
         if not set(groups) <= {'afr', 'amr', 'asj', 'eas', 'fin', 'mid', 'nfe', 'sas'}:
             raise ValueError(f'Unsupported gnomAD groups for {name}')
+    cfg['worker_network'] = 'offline'
     cfg.setdefault('scratch_dir', '/scratch/szabad')
     cfg.setdefault('download_workers', 4)
+    cfg['wall_time'] = wall_time(cfg.get('wall_time', '01:00:00'))
     if not isinstance(cfg['download_workers'], int) or not 1 <= cfg['download_workers'] <= 32:
         raise ValueError('download_workers must be between 1 and 32')
     return resolve_catalog_release(cfg)
@@ -553,6 +555,46 @@ def check_inputs(cfg, chroms):
             'picard_command': command}
 
 
+
+def require_login_network():
+    if os.environ.get('SLURM_JOB_ID'):
+        raise RuntimeError('Network access is forbidden in SLURM workers; the login-node controller must stage inputs first')
+
+
+def managed_gnomad(cfg, chrom, output):
+    namespace = hashlib.sha256(str(output.resolve()).encode()).hexdigest()[:16]
+    return local(cfg.get('scratch_dir', '/scratch/szabad')) / 'harmonized-variant-set' / namespace / f'chr_{chrom}' / f'gnomad.chr{chrom}.vcf.bgz'
+
+
+def count_cache_ready(output, chrom):
+    cache = output / 'gnomad_counts' / f'chr_{chrom}'
+    return nonempty(cache / 'counts.tsv.gz') and nonempty(cache / 'manifest.json')
+
+
+def staged_chromosomes(cfg, chroms):
+    output = local(cfg['output_dir'])
+    return {chrom for chrom in chroms if count_cache_ready(output, chrom)
+            or nonempty(local(cfg['gnomad_vcf'].format(chrom=chrom)))
+            or (nonempty(managed_gnomad(cfg, chrom, output))
+                and nonempty(Path(str(managed_gnomad(cfg, chrom, output)) + '.tbi'))
+                and nonempty(Path(str(managed_gnomad(cfg, chrom, output)) + '.download.json')))}
+
+
+def stage_gnomad(cfg, chrom):
+    """Login-node I/O only. No scientific filtering or normalization occurs here."""
+    require_login_network()
+    output = local(cfg['output_dir'])
+    cache = output / 'gnomad_counts'
+    cache.mkdir(parents=True, exist_ok=True)
+    with (cache / f'.chr_{chrom}.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if chrom in staged_chromosomes(cfg, [chrom]):
+            return
+        source = managed_gnomad(cfg, chrom, output)
+        url = cfg.get('reference_urls', {}).get('gnomad_vcf', REFERENCE_URLS['gnomad_vcf']).format(chrom=chrom)
+        parallel_download(url, source, workers=cfg.get('download_workers', 4))
+        download_reference(url + '.tbi', Path(str(source) + '.tbi'))
+
 def validate_source(filename, key):
     """Validate downloaded payloads before making them available to the pipeline."""
     if not filename.stat().st_size:
@@ -574,6 +616,7 @@ def validate_source(filename, key):
 
 
 def download_source(key, destination, urls, attempts=3):
+    require_login_network()
     destination.parent.mkdir(parents=True, exist_ok=True)
     # A fresh temporary file per invocation avoids reusing an interrupted payload.
     temporary = destination.with_name(destination.name + '.partial')
@@ -614,6 +657,7 @@ def download_source(key, destination, urls, attempts=3):
 
 def download_sources(cfg):
     """Stage discovery sources only; never download the large reference resources."""
+    require_login_network()
     sources = {
         'hapmap3_plus': ('https://api.figshare.com/v2/file/download/37802721',
                         'https://ndownloader.figshare.com/files/37802721'),
@@ -669,6 +713,7 @@ def reference_plan(cfg, chroms):
 
 def download_reference(url, destination):
     """Use curl's verified TLS, retry and HTTP Range support for large assets."""
+    require_login_network()
     if nonempty(destination):
         print(f'Reusing {destination}', flush=True)
         return
@@ -697,6 +742,7 @@ def download_reference(url, destination):
 
 
 def download_references(cfg, chroms):
+    require_login_network()
     for item in reference_plan(cfg, chroms):
         if nonempty(item['target']):
             print(f'Reusing {item["target"]}', flush=True)
@@ -748,6 +794,7 @@ def prepare_references(cfg, chroms):
 
 def parallel_download(url, destination, workers=4, chunk_size=128 * 1024 * 1024):
     """Resume independently verified HTTP ranges in one preallocated scratch file."""
+    require_login_network()
     if nonempty(destination):
         receipt = destination.with_name(destination.name + '.download.json')
         if not receipt.exists():
@@ -856,8 +903,7 @@ def candidate_counts(cfg, chrom, master, work, output):
                  'candidates_sha256': hashlib.sha256(master[['VARIANT_KEY']].to_csv(index=False).encode()).hexdigest(),
                  'reference': identity(local(cfg['reference_grch38'])),
                  'source': {'url': url} if owned else identity(source)}
-    namespace = hashlib.sha256(str(output.resolve()).encode()).hexdigest()[:16]
-    managed_source = local(cfg.get('scratch_dir', '/scratch/szabad')) / 'harmonized-variant-set' / namespace / f'chr_{chrom}' / f'gnomad.chr{chrom}.vcf.bgz'
+    managed_source = managed_gnomad(cfg, chrom, output)
     cache = output / 'gnomad_counts' / f'chr_{chrom}'
     cache.parent.mkdir(parents=True, exist_ok=True)
     with (cache.parent / f'.chr_{chrom}.lock').open('a') as lock:
@@ -866,9 +912,9 @@ def candidate_counts(cfg, chrom, master, work, output):
             receipt = None
             if owned:
                 source = managed_source
-                source.parent.mkdir(parents=True, exist_ok=True)
-                receipt = parallel_download(url, source, workers=cfg.get('download_workers', 4))
-                download_reference(url + '.tbi', Path(str(source) + '.tbi'))
+                if not nonempty(source) or not nonempty(Path(str(source) + '.tbi')):
+                    raise FileNotFoundError(f'Offline worker input was not staged: {source}. Resume the login-node controller.')
+                receipt = json.loads(Path(str(source) + '.download.json').read_text())
             subset = work / 'gnomad.candidates.vcf.gz'
             subset_vcf(source, master[['CHROM', 'POS']].assign(CHROM=chrom), subset, work)
             normalized = work / 'gnomad.normalized.vcf.gz'
@@ -922,7 +968,7 @@ def atomic_json(path, value):
 
 
 def scientific_config(cfg):
-    operational = {'slurm_account', 'scratch_dir', 'download_workers', 'gwas_catalog_snapshot'}
+    operational = {'slurm_account', 'scratch_dir', 'download_workers', 'wall_time', 'worker_network', 'gwas_catalog_snapshot'}
     return {key: value for key, value in cfg.items() if key not in operational}
 
 
@@ -947,6 +993,36 @@ def stage_complete(output, stage, cfg, chroms):
     except (OSError, ValueError, KeyError, TypeError):
         return False
 
+
+
+def wall_time(value):
+    match = re.fullmatch(r'(\d+):([0-5]\d):([0-5]\d)', value) if isinstance(value, str) else None
+    if not match or not any(int(part) for part in match.groups()):
+        raise ValueError('wall_time/--time must be a positive HH:MM:SS duration')
+    return f'{int(match[1]):02d}:{match[2]}:{match[3]}'
+
+
+def shorten_pending_jobs(active, limit):
+    def seconds(value):
+        if value == 'UNLIMITED':
+            return float('inf')
+        match = re.fullmatch(r'(?:(\d+)-)?(\d+):(\d+):(\d+)', value or '')
+        if not match:
+            return None
+        days, hours, minutes, secs = match.groups()
+        return int(days or 0) * 86400 + int(hours) * 3600 + int(minutes) * 60 + int(secs)
+    updated = set()
+    for job in active:
+        current = seconds(job.get('wall_time'))
+        if job['state'] != 'PENDING' or current is None or current <= seconds(limit):
+            continue
+        siblings = [j for j in active if j['root'] == job['root']]
+        job_id = job['root'] if all(j['state'] == 'PENDING' for j in siblings) else job['id']
+        if job_id in updated:
+            continue
+        subprocess.run(['scontrol', 'update', f'JobId={job_id}', f'TimeLimit={limit}'], check=True)
+        updated.add(job_id)
+        print(f'Reduced pending job {job_id} wall time to {limit}', flush=True)
 
 def slurm_account(cfg):
     account = cfg.get('slurm_account') or os.environ.get('SBATCH_ACCOUNT')
@@ -976,17 +1052,19 @@ def scheduler_jobs(provenance, run_id, completed):
     for attempt in range(3):
         try:
             raw = subprocess.check_output(['squeue', '--noheader', '--array', '--user', getpass.getuser(),
-                                           '--format=%i|%T|%k|%R'], text=True, stderr=subprocess.PIPE)
+                                           '--format=%i|%T|%k|%R|%l'], text=True, stderr=subprocess.PIPE)
             active = []
             for line in raw.splitlines():
-                fields = line.strip().split('|', 3)
-                if len(fields) != 4:
+                fields = line.strip().split('|', 4)
+                if len(fields) < 4:
                     continue
-                job, state, comment, reason = (value.strip() for value in fields)
+                job, state, comment, reason = (value.strip() for value in fields[:4])
                 root = job.split('_')[0]
-                stage = comment.removeprefix(f'hvs:{run_id}:') if comment.startswith(f'hvs:{run_id}:') else roots.get(root)
+                label = comment.removeprefix(f'hvs:{run_id}:') if comment.startswith(f'hvs:{run_id}:') else roots.get(root, '')
+                stage, _, protocol = label.partition('@')
                 if stage in ('prepare', 'candidates', 'chromosome', 'merge'):
-                    active.append({'id': job, 'root': root, 'stage': stage, 'state': state, 'reason': reason})
+                    active.append({'id': job, 'root': root, 'stage': stage, 'state': state, 'reason': reason, 'protocol': protocol,
+                                   'wall_time': fields[4].strip() if len(fields) == 5 else None})
             # Accounting confirms that a previously accepted job really ended;
             # an empty/broken queue response alone is never permission to duplicate it.
             inactive = {root: stage for root, stage in roots.items()
@@ -1027,7 +1105,7 @@ def cancel_pending(job):
     print(f'Replacing pending {job["stage"]} job {job["id"]} with corrected dependencies', flush=True)
 
 
-def submit(cfg, chroms, max_concurrent):
+def submit(cfg, chroms, max_concurrent, retry_baseline=None):
     """Reconcile durable stage outputs and live SLURM jobs, then submit only missing work."""
     command = picard_command(cfg)
     for tool in ('sbatch', 'squeue', 'bcftools', command[0]):
@@ -1052,7 +1130,7 @@ def submit(cfg, chroms, max_concurrent):
         completed = ({'candidates'} if done_candidates else set()) | ({'chromosome'} if len(done_chroms) == len(chroms) else set())
         if done_merge:
             print(f'Already complete. Final manifests: {output / "merge"}', flush=True)
-            return
+            return {'complete': True, 'done_chroms': sorted(done_chroms), 'active_chroms': [], 'unstaged': []}
         try:
             snapshot = check_inputs(cfg, chroms)
             needs_prepare = False
@@ -1061,6 +1139,18 @@ def submit(cfg, chroms, max_concurrent):
             snapshot = {'config': cfg, 'inputs': [], 'pending_reference_preparation': True}
             needs_prepare = True
         active = scheduler_jobs(provenance, run_id, completed)
+        obsolete = [j for j in active if j['stage'] in ('chromosome', 'merge')
+                    and j.get('protocol') != 'offline-v1' and j['state'] == 'PENDING']
+        cancelled = set()
+        for job in obsolete:
+            siblings = [j for j in active if j['root'] == job['root']]
+            target = job['root'] if all(j['state'] == 'PENDING' for j in siblings) else job['id']
+            if target not in cancelled:
+                cancel_pending({**job, 'id': target})
+                cancelled.add(target)
+        active = [j for j in active if j not in obsolete]
+        limit = wall_time(cfg.get('wall_time', '01:00:00'))
+        shorten_pending_jobs(active, limit)
         original = provenance / 'config.json'
         if original.exists():
             previous = json.loads(original.read_text())
@@ -1108,13 +1198,19 @@ def submit(cfg, chroms, max_concurrent):
         logs.mkdir(exist_ok=True)
         spec = ','.join(map(str, chroms))
         def sbatch(stage, dependencies=(), selected=None, **resources):
+            keys = [f'chr_{c}' for c in selected] if selected is not None else [stage]
+            attempts = submission_counts(journal)
+            if retry_baseline is not None and any(attempts.get(key, 0) > retry_baseline.get(key, 0) for key in keys):
+                raise ValueError(f'{stage} failed during this controller session; stopping rather than repeatedly submitting the same error. '
+                                 f'Worker logs: {logs}. Rerunning the launcher permits a new attempt using saved data.')
+            resources.setdefault('time', limit)
             options = [f'--account={account}'] if account else []
             if dependencies:
                 options += ['--dependency=afterok:' + ':'.join(dict.fromkeys(dependencies))]
             options += [f'--{key.replace("_", "-")}={value}' for key, value in resources.items()]
             if selected is not None:
                 options += [f'--array={",".join(map(str, selected))}%{max_concurrent}']
-            args = ['sbatch', '--parsable', '--kill-on-invalid-dep=yes', f'--comment=hvs:{run_id}:{stage}',
+            args = ['sbatch', '--parsable', '--kill-on-invalid-dep=yes', f'--comment=hvs:{run_id}:{stage}@offline-v1',
                     f'--job-name=hvs-{stage}', *options, '--output=' + str(logs / 'hvs-%x-%A_%a.out'),
                     str(worker_file), str(ROOT), str(config_file), str(code_file), stage, spec]
             intent = {'stage': stage, 'chromosomes': selected, 'state': 'submitting',
@@ -1143,6 +1239,10 @@ def submit(cfg, chroms, max_concurrent):
             for job in matches:
                 if 'DependencyNeverSatisfied' in job['reason'] or (upstream_replaced and job['state'] == 'PENDING'):
                     cancel_pending(job)
+                    for entry in journal:
+                        if entry.get('job') == job['root'] and stage != 'chromosome':
+                            entry['cancelled_pending'] = True
+                    atomic_json(journal_file, journal)
                 else:
                     keep.append(job)
             return keep
@@ -1150,7 +1250,7 @@ def submit(cfg, chroms, max_concurrent):
         prep_new = needs_prepare and not preparation
         prep_ids = [j['id'] for j in preparation]
         if prep_new:
-            prep_ids = [sbatch('prepare', time='48:00:00')]
+            prep_ids = [sbatch('prepare')]
         candidates = available('candidates', prep_new) if not done_candidates else []
         candidate_new = not done_candidates and not candidates
         candidate_ids = [j['id'] for j in candidates]
@@ -1169,15 +1269,170 @@ def submit(cfg, chroms, max_concurrent):
                 # Some schedulers render an array parent rather than expanded tasks.
                 active_chroms.update(set(chroms) - done_chroms)
                 dependencies.append(job['id'])
-        missing = sorted(set(chroms) - done_chroms - active_chroms)
+        unclaimed = sorted(set(chroms) - done_chroms - active_chroms)
+        ready = staged_chromosomes(cfg, unclaimed)
+        capacity = max(0, max_concurrent - len(active_chroms))
+        missing = sorted(ready)[:capacity]
         if missing:
             dependencies.append(sbatch('chromosome', list(dict.fromkeys(prep_ids + candidate_ids)), selected=missing,
-                                       time='48:00:00', cpus_per_task=cfg.get('download_workers', 4)))
-        merges = available('merge', bool(missing) or candidate_new or prep_new)
-        if not merges:
+                                       cpus_per_task=1))
+        covered = done_chroms | active_chroms | set(missing)
+        merges = available('merge', bool(missing) or candidate_new or prep_new or covered != set(chroms))
+        if not merges and covered == set(chroms):
             sbatch('merge', dependencies)
         print('Run reconciled:', json.dumps(jobs), '\nFinal manifests:', output / 'merge', flush=True)
+        return {'complete': False, 'done_chroms': sorted(done_chroms),
+                'active_chroms': sorted(active_chroms | set(missing)),
+                'unstaged': sorted(set(chroms) - covered)}
 
+
+
+def submission_counts(journal):
+    counts = {}
+    for entry in journal:
+        if not entry.get('job') or entry.get('cancelled_pending'):
+            continue
+        keys = [f'chr_{c}' for c in entry.get('chromosomes') or []] if entry['stage'] == 'chromosome' else [entry['stage']]
+        for key in keys:
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def coordinate(cfg, chroms, max_concurrent):
+    require_login_network()
+    output = local(cfg['output_dir'])
+    provenance = output / 'provenance'
+    provenance.mkdir(parents=True, exist_ok=True)
+    state_file = provenance / 'controller.json'
+    journal_file = provenance / 'submissions.json'
+    baseline = submission_counts(json.loads(journal_file.read_text()) if journal_file.exists() else [])
+    state = {'pid': os.getpid(), 'host': __import__('socket').gethostname(), 'state': 'running',
+             'started_utc': datetime.now(timezone.utc).isoformat(), 'network_location': 'login-node'}
+    atomic_json(state_file, state)
+    try:
+        while True:
+            controls = provenance / 'controller_options.json'
+            if controls.exists():
+                options = json.loads(controls.read_text())
+                for key in ('slurm_account', 'scratch_dir', 'download_workers', 'wall_time'):
+                    if key in options['config']:
+                        cfg[key] = options['config'][key]
+                max_concurrent = options['max_concurrent']
+            progress = submit(cfg, chroms, max_concurrent, retry_baseline=baseline)
+            state.update(progress, updated_utc=datetime.now(timezone.utc).isoformat())
+            atomic_json(state_file, state)
+            if progress['complete']:
+                state['state'] = 'completed'
+                atomic_json(state_file, state)
+                return
+            slots = max(0, max_concurrent - len(progress['active_chroms']))
+            batch = progress['unstaged'][:slots]
+            if batch:
+                with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+                    futures = [pool.submit(stage_gnomad, cfg, chrom) for chrom in batch]
+                    for future in as_completed(futures):
+                        future.result()
+                        submit(cfg, chroms, max_concurrent, retry_baseline=baseline)
+            else:
+                sleep(30)
+    except BaseException as exc:
+        detail = latest_worker_error(provenance) if 'failed during this controller session' in str(exc) else ''
+        state.update(state='failed', error=str(exc), worker_log=detail, updated_utc=datetime.now(timezone.utc).isoformat())
+        atomic_json(state_file, state)
+        raise
+
+
+def start_controller(cfg, chroms, max_concurrent):
+    require_login_network()
+    output = local(cfg['output_dir'])
+    provenance = output / 'provenance'
+    provenance.mkdir(parents=True, exist_ok=True)
+    options = {'config': cfg, 'max_concurrent': max_concurrent, 'chromosomes': list(chroms)}
+    lock = (output / '.controller.lock').open('a')
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            previous_file = provenance / 'controller_options.json'
+            previous = json.loads(previous_file.read_text()) if previous_file.exists() else options
+            if scientific_config(previous['config']) != scientific_config(cfg) or previous.get('chromosomes', list(chroms)) != list(chroms):
+                raise ValueError('A controller is active for different scientific settings; use a separate output_dir')
+            atomic_json(previous_file, options)
+            print(f'Login-node controller is already running; settings updated. Status: {provenance / "controller.json"}', flush=True)
+            return
+        atomic_json(provenance / 'controller_options.json', options)
+        if all(stage_complete(output, f'chr_{c}', cfg, chroms) for c in chroms) and stage_complete(output, 'merge', cfg, chroms):
+            print(f'Already complete. Final manifests: {output / "merge"}', flush=True)
+            return
+        config_file = provenance / f'controller-config.{hashlib.sha256(json.dumps(options, sort_keys=True).encode()).hexdigest()[:16]}.json'
+        atomic_json(config_file, cfg)
+        code_file = provenance / f'controller-workflow.{digest(Path(__file__))[:16]}.py'
+        if not code_file.exists():
+            shutil.copyfile(Path(__file__), code_file)
+        logs = ROOT / 'logs'
+        logs.mkdir(exist_ok=True)
+        log_file = logs / f'hvs-controller-{hashlib.sha256(str(output).encode()).hexdigest()[:16]}.out'
+        command = [__import__('sys').executable, '-u', str(code_file), '--stage', 'coordinate',
+                   '--config', str(config_file), '--chromosomes', ','.join(map(str, chroms)),
+                   '--max-concurrent', str(max_concurrent), '--controller-fd', str(lock.fileno())]
+        environment = {**os.environ, 'HVS_ROOT': str(ROOT)}
+        with log_file.open('a') as log:
+            child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                     start_new_session=True, pass_fds=(lock.fileno(),), env=environment)
+        print(f'Login-node controller started (PID {child.pid}). All SLURM workers are offline.\n'
+              f'Progress/errors: {log_file}\nStatus: {provenance / "controller.json"}', flush=True)
+    finally:
+        lock.close()  # Child inherits the same open-file lock until it exits.
+
+
+def latest_worker_error(provenance):
+    journal_file = provenance / 'submissions.json'
+    journal = json.loads(journal_file.read_text()) if journal_file.exists() else []
+    for entry in reversed(journal):
+        if not entry.get('job'):
+            continue
+        paths = sorted((ROOT / 'logs').glob(f'hvs-hvs-{entry["stage"]}-{entry["job"]}_*.out'),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in paths[:4]:
+            with path.open('rb') as handle:
+                handle.seek(max(0, path.stat().st_size - 16384))
+                tail = handle.read().decode(errors='replace')
+            if any(word in tail for word in ('Traceback', 'ERROR', 'Error', 'TIME LIMIT', 'OUT_OF_MEMORY')):
+                return f'{path}\n{tail[-6000:]}'
+    return ''
+
+
+def show_status(cfg):
+    output = local(cfg['output_dir'])
+    provenance = output / 'provenance'
+    state_file = provenance / 'controller.json'
+    state = json.loads(state_file.read_text()) if state_file.exists() else {}
+    run_file = provenance / 'run.json'
+    run = json.loads(run_file.read_text()) if run_file.exists() else {}
+    options_file = provenance / 'controller_options.json'
+    options = json.loads(options_file.read_text()) if options_file.exists() else {}
+    chroms = run.get('chromosomes', options.get('chromosomes', list(range(1, 23))))
+    frozen = provenance / 'config.json'
+    effective = json.loads(frozen.read_text()) if frozen.exists() else cfg
+    done = [c for c in chroms if stage_complete(output, f'chr_{c}', effective, chroms)]
+    merged = len(done) == len(chroms) and stage_complete(output, 'merge', effective, chroms)
+    running = False
+    lockfile = output / '.controller.lock'
+    if lockfile.exists():
+        with lockfile.open('r') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                running = True
+    print('Controller:', 'completed' if merged else 'running on login node' if running else state.get('state', 'not running'))
+    print(f'Completed chromosomes: {len(done)}/{len(chroms)}')
+    print('Final merge:', output / 'merge' if merged else 'not complete')
+    if not running and not merged:
+        print('Resume with: bash run.sh')
+    if not running and state.get('error'):
+        print('Last error:', state['error'])
+        if state.get('worker_log'):
+            print(state['worker_log'])
 
 def merge(cfg, chroms, directory, output):
     names = ['master.GRCh38'] + [f'{a}.{build}' for a in cfg['ancestries'] for build in ('GRCh38', 'GRCh37')]
@@ -1242,26 +1497,34 @@ def execute_stage(cfg, stage, chrom, chroms):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default='config.json')
-    parser.add_argument('--stage', default='submit', choices=['submit', 'check', 'prepare', 'candidates', 'chromosome', 'merge'])
+    parser.add_argument('--stage', default='submit', choices=['submit', 'coordinate', 'check', 'prepare', 'candidates', 'chromosome', 'merge'])
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--check-only', action='store_true')
+    mode.add_argument('--status', action='store_true')
     mode.add_argument('--download-sources', action='store_true')
     mode.add_argument('--download-references', action='store_true')
     parser.add_argument('--max-concurrent', type=int, default=2)
     parser.add_argument('--download-workers', type=int)
     parser.add_argument('--scratch-dir')
     parser.add_argument('--account')
+    parser.add_argument('--time')
+    parser.add_argument('--controller-fd', type=int, help=argparse.SUPPRESS)
     parser.add_argument('--chromosomes')
     parser.add_argument('--chrom', type=int, choices=range(1,23))
     args = parser.parse_args()
+    if args.status:
+        show_status(json.loads(local(args.config).read_text()))
+        return
     if args.check_only:
         args.stage = 'check'
-    if (args.download_sources or args.download_references or args.stage in ('submit', 'check')) and os.environ.get('SLURM_JOB_ID'):
+    if (args.download_sources or args.download_references or args.stage in ('submit', 'coordinate', 'check')) and os.environ.get('SLURM_JOB_ID'):
         parser.error('Run downloads/preflight/submission from the login node')
     if args.chromosomes is None:
         try:
             raw_cfg = json.loads(local(args.config).read_text())
             saved_run = local(raw_cfg['output_dir']) / 'provenance' / 'run.json'
+            if not saved_run.exists():
+                saved_run = saved_run.with_name('controller_options.json')
             saved = json.loads(saved_run.read_text()) if saved_run.exists() else {}
             args.chromosomes = ','.join(map(str, saved['chromosomes'])) if saved else '1-22'
         except (OSError, ValueError, KeyError) as exc:
@@ -1293,18 +1556,26 @@ def main():
             cfg['scratch_dir'] = args.scratch_dir
         if args.account is not None:
             cfg['slurm_account'] = args.account
+        if args.time is not None:
+            cfg['wall_time'] = wall_time(args.time)
         if args.download_references or args.stage == 'submit':
             download_references(cfg, chroms)
             if args.download_references:
                 return
     except (OSError, ValueError, EOFError, zipfile.BadZipFile, HTTPException) as exc:
         parser.error(str(exc))
+    if args.stage == 'coordinate':
+        if args.controller_fd is None:
+            parser.error('The coordinator must be started by the login-node launcher')
+        with os.fdopen(args.controller_fd, 'a'):
+            coordinate(cfg, chroms, args.max_concurrent)
+        return
     if args.stage in ('check', 'submit'):
         try:
             if args.stage == 'check':
                 print(json.dumps(check_inputs(cfg, chroms), indent=2))
             else:
-                submit(cfg, chroms, args.max_concurrent)
+                start_controller(cfg, chroms, args.max_concurrent)
         except (OSError, ValueError, subprocess.CalledProcessError) as exc:
             parser.error(str(exc))
         return

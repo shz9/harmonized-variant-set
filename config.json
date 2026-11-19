@@ -9,6 +9,7 @@
   "gnomad_release": "4.1",
   "scratch_dir": "/scratch/szabad",
   "download_workers": 4,
+  "wall_time": "01:00:00",
   "gnomad_data_type": "genomes",
   "gnomad_vcf": "data/gnomad/gnomad.genomes.v4.1.sites.chr{chrom}.vcf.bgz",
   "dbsnp_vcf": "/scratch/szabad/harmonized-variant-set/reference/GCF_000001405.40.gz",

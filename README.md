@@ -134,13 +134,25 @@ bash run.sh --account def-sgravel --chromosomes 22
 bash run.sh --chromosomes 1-22 --max-concurrent 2 --download-workers 4 --scratch-dir /scratch/szabad
 ```
 
-No manual resource download or index creation is required. On a new run the
-default without `--chromosomes` processes 1–22; on a retry it reuses the saved
-chromosome list. Common references are staged first; gnomAD VCFs
-are downloaded **inside chromosome SLURM jobs**, after the candidate list and
-canonical allele keys are available. Defaults are two concurrent chromosome jobs
-and four download threads per job. Each chromosome job requests 8 GiB, four CPUs
-(or `--download-workers`) and 48 hours.
+No manual resource download or index creation is required. The launcher starts
+a detached **login-node controller** and prints its log/status paths. It survives
+terminal disconnection; rerunning the same command reuses the controller or
+restarts a stopped one. On a new run, omitting `--chromosomes` selects 1–22; on a
+retry it reuses the saved chromosome list.
+
+**Compute nodes do not need internet access. All network operations run on the
+login node.** The controller downloads at most two chromosome VCFs at a time
+(default), with four parallel HTTP connections per VCF. It submits a chromosome
+SLURM task only after that VCF and its index are available on shared scratch.
+Scientific extraction, allele normalization, ancestry filtering and liftover run
+in strictly offline SLURM jobs. All jobs request 1 CPU, 8 GiB and one hour by
+default; `--download-workers` controls login-node transfer concurrency only.
+
+The controller polls SLURM, reuses completed stages, and advances the download
+window as workers finish and remove raw files. `--max-concurrent` bounds both
+outstanding chromosome jobs and the managed scratch staging window across all
+array submissions. It never queues unstaged chromosomes or the final merge
+before every required chromosome is complete or has a valid worker dependency.
 
 Raw gnomAD files go under `/scratch/szabad/harmonized-variant-set/<output-id>/chr_N/`,
 where the output ID isolates projects/panel versions. `--scratch-dir` or the
@@ -172,7 +184,16 @@ and extraction on a worker retry; input/ancestry-group signatures and a table
 SHA256 prevent stale or corrupt cache reuse. Rerunning the same launcher command
 automatically resumes missing/failed stages and reuses completed stages and
 active jobs in the same output directory.
-Chromosome compute nodes need outbound HTTPS access to the download host.
+Download helpers explicitly refuse to run when `SLURM_JOB_ID` is set. An offline
+worker with a missing local input fails immediately instead of trying HTTP. On
+upgrade, the controller cancels this run's pending chromosome/merge jobs created
+by the incompatible network-on-compute worker and replaces them after staging.
+Already running jobs are allowed to finish before their slots are reused.
+
+All stages default to `01:00:00`. Override with `--time 00:30:00` or the
+`wall_time` configuration key. On rerun, pending pipeline jobs with longer limits
+are shortened in place; running jobs are left alone. Timeouts retain partial
+downloads and count caches for the next run.
 
 The default account is read from `job.sbatch` (currently `def-sgravel`). Supply
 `--account def-sgravel` explicitly, or set `slurm_account` in `config.json`, to
@@ -182,7 +203,7 @@ An account rejection leaves the run recoverable: rerun the same command after
 correcting the account. No output-directory change or provenance deletion is
 needed.
 
-The launcher checks SLURM state itself with `squeue` and `sacct`. It reuses
+The login controller checks SLURM state itself with `squeue` and `sacct`. It reuses
 pending/running jobs, submits only missing or failed chromosomes, and replaces
 pending downstream jobs whose dependencies failed or were replaced. A durable
 submission journal and run-specific SLURM comments recover jobs accepted before
@@ -191,9 +212,25 @@ duplicate launchers or requeued workers from repeating completed work. If the
 scheduler cannot be queried reliably, submission stops before duplicating jobs;
 rerun when the scheduler is available.
 
+If a newly submitted worker fails, the controller records the error and a bounded
+worker-log excerpt and stops rather than repeatedly resubmitting the same failure.
+Rerunning the launcher authorizes another attempt using retained downloads and
+caches. Account rejections and transfer failures are also saved in controller
+status. Check progress or the last failure without submitting anything:
+
+```bash
+bash run.sh --status
+```
+
+Status is stored in `output/<version>/provenance/controller.json`; the printed
+`logs/hvs-controller-*.out` path contains transfer progress and submission history.
+A lock on the shared output directory ensures only one login controller runs,
+even when the launcher is invoked from multiple login nodes. Rerunning while it
+is active updates operational settings such as concurrency and wall time.
+
 Completed runs are a no-op on rerun. Incomplete stage directories are retained
 under `output/<version>/recovery/` before being rebuilt; count caches and partial
-scratch downloads are preserved. Account, scratch and download-worker settings
+scratch downloads are preserved. Account, wall time, scratch and download-worker settings
 can change on retry. Changes to scientific selection settings or an explicitly
 different chromosome list require a separate output version to avoid mixing
 panels.
@@ -233,8 +270,8 @@ integrity, and replace the destination only after validation succeeds. Reruns
 restart incomplete `.partial` files and repair empty destination files; completed
 sources are reused. No manual removal of partial files is needed.
 
-Environment creation and common-reference downloads run on login; gnomAD
-downloads and extraction run on compute nodes. `--setup-only` installs the
+Environment creation and all downloads run on login; scientific extraction runs
+on offline compute nodes. `--setup-only` installs the
 Python dependencies and checks that bcftools, the configured Picard executable
 and SLURM sbatch/curl are available, without requiring reference data or submitting
 jobs. It can be rerun to reuse the environment and install missing Python
@@ -289,12 +326,13 @@ After updating the repository, rerun `bash run.sh --setup-only`; an existing
 The submission creates a **prepare → candidates → chromosome array → merge**
 chain using `afterok` dependencies. The prepare job is omitted if all common
 references and indexes already pass preflight. It requests 1 CPU, 8 GiB and
-48 hours; chromosome jobs use the resources described above, while candidates
-and merge jobs request 1 CPU, 8 GiB and 5 hours. Java is capped at 4 GiB.
+one hour; chromosome jobs use the resources described above, while candidates
+and merge jobs request 1 CPU, 8 GiB and one hour. Java is capped at 4 GiB.
 Preparation unpacks FASTAs, creates FASTA indexes and Picard dictionaries, and
 builds absent indexes for existing local VCFs. Preparation writes the final
 preflight inventory before downstream jobs can start. `SLURM_TMPDIR` holds
-small working subsets; full gnomAD downloads use the configured shared scratch.
+small working subsets; full gnomAD files are staged by the login controller on
+the configured shared scratch. No worker stage performs network requests.
 
 Automatically staged resources (or provide existing paths in `config.json`):
 

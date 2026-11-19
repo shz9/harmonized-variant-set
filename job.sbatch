@@ -3,8 +3,8 @@
 #SBATCH --job-name=hvs
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=8G
-#SBATCH --time=05:00:00
-# Internal worker: common reference preparation, then scratch downloads/count extraction and analysis.
+#SBATCH --time=01:00:00
+# Offline worker only: all network transfers are performed by the login-node controller.
 set -euo pipefail
 export HVS_ROOT="$1"
 config_file="$2"

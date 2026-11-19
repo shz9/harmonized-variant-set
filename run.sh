@@ -5,18 +5,20 @@ cd "$(dirname "$0")"
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
   cat <<'HELP'
 Usage: bash run.sh [options]
+  --time HH:MM:SS      Wall time per job (default: 01:00:00)
   --account ACCOUNT     SLURM billing account (default: config/environment/job.sbatch)
   --config FILE         Configuration (relative to this project's root)
   --download-sources    Download missing HapMap3+/Catalog files, then exit
   --download-references Download reference files/indexes, then exit (no jobs)
   --setup-only          Create environment, install/check dependencies, then exit
   --check-only          Check existing environment/resources; do not submit
+  --status              Show controller progress and last error; do not submit
   --chromosomes LIST    Autosomes, e.g. 22 or 1-3,22 (default: saved run, otherwise 1-22)
   --max-concurrent N    Maximum simultaneous chromosome jobs (default: 2)
   --download-workers N  Parallel slices per chromosome download (default: 4)
   --scratch-dir DIR     Raw gnomAD download storage (default: /scratch/szabad)
-Default: stage common references, then submit preparation and chromosome download/extraction jobs.
-Chromosome jobs download gnomAD to scratch, cache candidate counts, then remove their raw VCFs.
+Default: start/resume the login-node download controller and offline SLURM analysis jobs.
+The login controller downloads to scratch; offline chromosome jobs cache counts and clean up VCFs.
 Environment: PYTHON_MODULE=python/3.13; HVS_TOOL_MODULES="bcftools picard".
 HELP
   exit 0
@@ -28,10 +30,12 @@ fi
 check_only=0
 download_only=0
 setup_only=0
+status_only=0
 for arg in "$@"; do
-  [[ "$arg" != --check-only ]] || check_only=1
+  [[ "$arg" != --check-only && "$arg" != --status ]] || check_only=1
   [[ "$arg" != --download-sources && "$arg" != --download-references ]] || download_only=1
   [[ "$arg" != --setup-only ]] || setup_only=1
+  [[ "$arg" != --status ]] || status_only=1
 done
 if (( check_only + download_only + setup_only > 1 )); then
   echo "Use only one of --setup-only, --check-only, --download-sources or --download-references." >&2
@@ -39,7 +43,7 @@ if (( check_only + download_only + setup_only > 1 )); then
 fi
 if type module >/dev/null 2>&1; then
   module load "${PYTHON_MODULE:-python/3.13}"
-  if [[ "$download_only" == 0 || " $* " == *" --download-references "* ]]; then
+  if [[ "$status_only" == 0 && ( "$download_only" == 0 || " $* " == *" --download-references "* ) ]]; then
     read -r -a tool_modules <<< "${HVS_TOOL_MODULES-bcftools picard}"
     for tool_module in "${tool_modules[@]}"; do module load "$tool_module"; done
   fi
