@@ -1,4 +1,5 @@
 #!/bin/bash
+#SBATCH --account=def-sgravel
 #SBATCH --job-name=hvs
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=8G
