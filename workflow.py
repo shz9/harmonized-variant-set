@@ -7,6 +7,7 @@ import fcntl
 from collections import defaultdict
 from datetime import datetime, timezone
 import gzip
+import getpass
 import hashlib
 from http.client import HTTPException
 from importlib.metadata import version
@@ -910,54 +911,272 @@ def candidate_counts(cfg, chrom, master, work, output):
         return frequencies, duplicate
 
 
+def atomic_json(path, value):
+    temporary = path.with_name(path.name + f'.{os.getpid()}.tmp')
+    with temporary.open('w') as handle:
+        json.dump(value, handle, indent=2)
+        handle.write('\n')
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+
+
+def scientific_config(cfg):
+    operational = {'slurm_account', 'scratch_dir', 'download_workers', 'gwas_catalog_snapshot'}
+    return {key: value for key, value in cfg.items() if key not in operational}
+
+
+def stage_complete(output, stage, cfg, chroms):
+    directory = output / stage
+    try:
+        manifest = json.loads((directory / 'manifest.json').read_text())
+        if scientific_config(manifest['config']) != scientific_config(cfg):
+            return False
+        if stage == 'candidates':
+            files = [f'chr_{c}.tsv.gz' for c in range(1, 23)]
+        elif stage == 'merge' or stage.startswith('chr_'):
+            files = ['master.GRCh38.tsv.gz'] + [f'{a}.{build}.tsv.gz' for a in cfg['ancestries']
+                      for build in ('GRCh38', 'GRCh37')]
+            if stage.startswith('chr_'):
+                files += [f'{a}.audit.tsv.gz' for a in cfg['ancestries']]
+            elif manifest.get('chromosomes') != list(chroms):
+                return False
+        else:
+            files = []
+        return all(nonempty(directory / name) for name in files)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def slurm_account(cfg):
+    account = cfg.get('slurm_account') or os.environ.get('SBATCH_ACCOUNT')
+    if not account:
+        worker = ROOT / 'job.sbatch'
+        if not worker.exists():
+            worker = Path(__file__).with_name('job.sbatch')
+        if worker.exists():
+            match = re.search(r'^#SBATCH\s+(?:--account(?:=|\s+)|-A\s+)(\S+)', worker.read_text(), re.M)
+            if match:
+                account = match.group(1)
+    if account and not re.fullmatch(r'[A-Za-z0-9_.-]+', account):
+        raise ValueError('Invalid SLURM account name')
+    return account
+
+
+def scheduler_jobs(provenance, run_id, completed):
+    """Discover live jobs, including submissions accepted before their ID was saved."""
+    known = json.loads((provenance / 'jobs.json').read_text()) if (provenance / 'jobs.json').exists() else {}
+    journal = json.loads((provenance / 'submissions.json').read_text()) if (provenance / 'submissions.json').exists() else []
+    roots = {str(job): stage for stage, job in known.items()}
+    roots.update({str(entry['job']): entry['stage'] for entry in journal if entry.get('job')})
+    terminal_file = provenance / 'terminal_jobs.json'
+    terminal_roots = set(json.loads(terminal_file.read_text())) if terminal_file.exists() else set()
+    terminal = {'COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY',
+                'NODE_FAIL', 'PREEMPTED', 'BOOT_FAIL', 'DEADLINE', 'REVOKED', 'SPECIAL_EXIT'}
+    for attempt in range(3):
+        try:
+            raw = subprocess.check_output(['squeue', '--noheader', '--array', '--user', getpass.getuser(),
+                                           '--format=%i|%T|%k|%R'], text=True, stderr=subprocess.PIPE)
+            active = []
+            for line in raw.splitlines():
+                fields = line.strip().split('|', 3)
+                if len(fields) != 4:
+                    continue
+                job, state, comment, reason = (value.strip() for value in fields)
+                root = job.split('_')[0]
+                stage = comment.removeprefix(f'hvs:{run_id}:') if comment.startswith(f'hvs:{run_id}:') else roots.get(root)
+                if stage in ('prepare', 'candidates', 'chromosome', 'merge'):
+                    active.append({'id': job, 'root': root, 'stage': stage, 'state': state, 'reason': reason})
+            # Accounting confirms that a previously accepted job really ended;
+            # an empty/broken queue response alone is never permission to duplicate it.
+            inactive = {root: stage for root, stage in roots.items()
+                        if root not in {job['root'] for job in active} and stage not in completed and root not in terminal_roots}
+            if not inactive:
+                return active
+            raw = subprocess.check_output(['sacct', '--noheader', '--parsable2', '--jobs', ','.join(sorted(inactive)),
+                                           '--format=JobID%64,State%40'], text=True, stderr=subprocess.PIPE)
+            settled = set()
+            unsettled = set()
+            for line in raw.splitlines():
+                fields = line.strip().split('|')
+                if len(fields) < 2 or '.' in fields[0]:
+                    continue
+                root = fields[0].strip().split('_')[0]
+                words = fields[1].strip().split()
+                if not words:
+                    continue
+                state = words[0].rstrip('+')
+                (settled if state in terminal else unsettled).add(root)
+            terminal_roots.update(settled - unsettled)
+            atomic_json(terminal_file, sorted(terminal_roots))
+            if set(inactive) <= terminal_roots:
+                return active
+        except (OSError, subprocess.CalledProcessError) as exc:
+            detail = getattr(exc, 'stderr', None) or str(exc)
+            raise ValueError(f'Unable to reconcile SLURM state safely: {detail}. No duplicate jobs were submitted.') from exc
+        if attempt < 2:
+            sleep(attempt + 1)
+    raise ValueError('SLURM accounting has not settled for a recorded submission. No jobs were duplicated; '
+                     'rerun the same command after the scheduler catches up. Saved work is retained.')
+
+
+def cancel_pending(job):
+    if job['state'] != 'PENDING':
+        raise ValueError(f'Cannot replace active {job["stage"]} job {job["id"]} while its prerequisite is incomplete')
+    subprocess.run(['scancel', job['id']], check=True)
+    print(f'Replacing pending {job["stage"]} job {job["id"]} with corrected dependencies', flush=True)
+
+
 def submit(cfg, chroms, max_concurrent):
-    """Small preflight and dependent submissions only; no reference data are parsed on login."""
-    # Reference files may still be compressed and their indexes absent. Validate
-    # those on the prepare job, then gate every analysis job on its success.
+    """Reconcile durable stage outputs and live SLURM jobs, then submit only missing work."""
     command = picard_command(cfg)
-    for tool in ('sbatch', 'bcftools', command[0]):
+    for tool in ('sbatch', 'squeue', 'bcftools', command[0]):
         if not shutil.which(tool):
             raise FileNotFoundError(f'Missing executable: {tool}')
-    needs_prepare = False
-    try:
-        snapshot = check_inputs(cfg, chroms)
-    except FileNotFoundError:
-        needs_prepare = True
-        snapshot = {'config': cfg, 'inputs': [], 'pending_reference_preparation': True}
     output = local(cfg['output_dir'])
     output.mkdir(parents=True, exist_ok=True)
-    provenance = output / 'provenance'
-    if provenance.exists():
-        raise FileExistsError(f'{provenance} exists: inspect its jobs before using a fresh output_dir/version')
-    provenance.mkdir()  # One submission per version; also prevents accidental duplicate arrays.
-    (provenance / 'preflight.json').write_text(json.dumps(snapshot, indent=2)+'\n')
-    config_file = provenance / 'config.json'
-    config_file.write_text(json.dumps(cfg, indent=2)+'\n')
-    code_file = provenance / 'workflow.py'
-    shutil.copyfile(Path(__file__), code_file)
-    jobs = {}
-    spec = ','.join(map(str, chroms))
-    logs = ROOT / 'logs'
-    logs.mkdir(exist_ok=True)
-    def sbatch(stage, *options):
-        command = ['sbatch', '--parsable', '--kill-on-invalid-dep=yes', *options,
-            '--output='+str(logs / 'hvs-%x-%A_%a.out'), str(ROOT / 'job.sbatch'),
-            str(ROOT), str(config_file), str(code_file), stage, spec]
-        print('RUN', ' '.join(command), flush=True)
-        job = subprocess.check_output(command, text=True).strip().split(';')[0]
-        if not job.isdigit():
-            raise ValueError(f'Unexpected sbatch result: {job!r}')
-        jobs[stage] = job
-        (provenance / 'jobs.json').write_text(json.dumps(jobs, indent=2)+'\n')
-        return job
-    preparation = sbatch('prepare', '--job-name=hvs-prepare', '--time=48:00:00') if needs_prepare else None
-    dependency = [f'--dependency=afterok:{preparation}'] if preparation else []
-    first = sbatch('candidates', '--job-name=hvs-candidates', *dependency)
-    array = sbatch('chromosome', '--job-name=hvs-chromosome', f'--dependency=afterok:{first}',
-                   f'--array={spec}%{max_concurrent}', '--time=48:00:00',
-                   f'--cpus-per-task={cfg.get("download_workers", 4)}')
-    sbatch('merge', '--job-name=hvs-merge', f'--dependency=afterok:{array}')
-    print('Submitted:', json.dumps(jobs), '\nFinal manifests:', output / 'merge', flush=True)
+    # Serializes both first submission and all retries from concurrent launchers.
+    with (output / '.submit.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        provenance = output / 'provenance'
+        provenance.mkdir(exist_ok=True)
+        run_file = provenance / 'run.json'
+        run_id = hashlib.sha256(str(output).encode()).hexdigest()[:16]
+        if run_file.exists():
+            saved_run = json.loads(run_file.read_text())
+            if saved_run['chromosomes'] != list(chroms):
+                raise ValueError(f'This run uses chromosomes {saved_run["chromosomes"]}; use the same list or a new output_dir for a different panel')
+        done_candidates = stage_complete(output, 'candidates', cfg, chroms)
+        done_chroms = {c for c in chroms if stage_complete(output, f'chr_{c}', cfg, chroms)}
+        done_merge = len(done_chroms) == len(chroms) and stage_complete(output, 'merge', cfg, chroms)
+        completed = ({'candidates'} if done_candidates else set()) | ({'chromosome'} if len(done_chroms) == len(chroms) else set())
+        if done_merge:
+            print(f'Already complete. Final manifests: {output / "merge"}', flush=True)
+            return
+        try:
+            snapshot = check_inputs(cfg, chroms)
+            needs_prepare = False
+            completed.add('prepare')
+        except FileNotFoundError:
+            snapshot = {'config': cfg, 'inputs': [], 'pending_reference_preparation': True}
+            needs_prepare = True
+        active = scheduler_jobs(provenance, run_id, completed)
+        original = provenance / 'config.json'
+        if original.exists():
+            previous = json.loads(original.read_text())
+            changed = scientific_config(previous) != scientific_config(cfg)
+            has_results = any(output.glob('*/manifest.json'))
+            if changed and (active or has_results):
+                raise ValueError('Scientific configuration changed for an existing run; use a new output_dir for a different panel. '
+                                 'Account, download workers and scratch settings can be changed in place.')
+        account = slurm_account(cfg)
+        preflight_file = provenance / 'preflight.json'
+        if not preflight_file.exists() or (not needs_prepare and json.loads(preflight_file.read_text()).get('pending_reference_preparation')):
+            atomic_json(preflight_file, snapshot)
+        # Immutable revisions keep queued/running workers isolated from launcher updates.
+        config_hash = hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:16]
+        config_file = provenance / f'config.{config_hash}.json'
+        atomic_json(config_file, cfg)
+        code_file = provenance / f'workflow.{digest(Path(__file__))[:16]}.py'
+        if not code_file.exists():
+            shutil.copyfile(Path(__file__), code_file)
+        worker_source = ROOT / 'job.sbatch'
+        worker_file = worker_source
+        if worker_source.exists():
+            worker_file = provenance / f'job.{digest(worker_source)[:16]}.sbatch'
+            if not worker_file.exists():
+                shutil.copyfile(worker_source, worker_file)
+        if not original.exists() or (not active and not any(output.glob('*/manifest.json'))):
+            atomic_json(original, cfg)
+        if not (provenance / 'workflow.py').exists():
+            shutil.copyfile(Path(__file__), provenance / 'workflow.py')
+        atomic_json(run_file, {'chromosomes': list(chroms), 'run_id': run_id, 'account': account})
+        jobs_file = provenance / 'jobs.json'
+        jobs = json.loads(jobs_file.read_text()) if jobs_file.exists() else {}
+        journal_file = provenance / 'submissions.json'
+        journal = json.loads(journal_file.read_text()) if journal_file.exists() else []
+        recorded = {entry.get('job') for entry in journal}
+        for job in active:
+            jobs[job['stage']] = job['root']
+            if job['root'] not in recorded:
+                journal.append({'stage': job['stage'], 'job': job['root'], 'state': 'adopted',
+                                'created_utc': datetime.now(timezone.utc).isoformat()})
+                recorded.add(job['root'])
+        atomic_json(journal_file, journal)
+        atomic_json(jobs_file, jobs)
+        logs = ROOT / 'logs'
+        logs.mkdir(exist_ok=True)
+        spec = ','.join(map(str, chroms))
+        def sbatch(stage, dependencies=(), selected=None, **resources):
+            options = [f'--account={account}'] if account else []
+            if dependencies:
+                options += ['--dependency=afterok:' + ':'.join(dict.fromkeys(dependencies))]
+            options += [f'--{key.replace("_", "-")}={value}' for key, value in resources.items()]
+            if selected is not None:
+                options += [f'--array={",".join(map(str, selected))}%{max_concurrent}']
+            args = ['sbatch', '--parsable', '--kill-on-invalid-dep=yes', f'--comment=hvs:{run_id}:{stage}',
+                    f'--job-name=hvs-{stage}', *options, '--output=' + str(logs / 'hvs-%x-%A_%a.out'),
+                    str(worker_file), str(ROOT), str(config_file), str(code_file), stage, spec]
+            intent = {'stage': stage, 'chromosomes': selected, 'state': 'submitting',
+                      'created_utc': datetime.now(timezone.utc).isoformat(), 'command': args}
+            journal.append(intent)
+            atomic_json(journal_file, journal)
+            print('RUN', ' '.join(args), flush=True)
+            try:
+                job = subprocess.check_output(args, text=True, stderr=subprocess.PIPE).strip().split(';')[0]
+                if not job.isdigit():
+                    raise ValueError(f'Unexpected sbatch response: {job!r}')
+            except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+                detail = getattr(exc, 'stderr', None) or str(exc)
+                intent.update(state='submission_failed', error=detail)
+                atomic_json(journal_file, journal)
+                raise ValueError(f'SLURM rejected/interrupted {stage} submission: {detail}\n'
+                                 'The run is saved. Rerun the same command; completed stages and active jobs will be reused.') from exc
+            intent.update(state='accepted', job=job)
+            atomic_json(journal_file, journal)
+            jobs[stage] = job
+            atomic_json(jobs_file, jobs)
+            return job
+        def available(stage, upstream_replaced=False):
+            matches = [job for job in active if job['stage'] == stage]
+            keep = []
+            for job in matches:
+                if 'DependencyNeverSatisfied' in job['reason'] or (upstream_replaced and job['state'] == 'PENDING'):
+                    cancel_pending(job)
+                else:
+                    keep.append(job)
+            return keep
+        preparation = available('prepare') if needs_prepare else []
+        prep_new = needs_prepare and not preparation
+        prep_ids = [j['id'] for j in preparation]
+        if prep_new:
+            prep_ids = [sbatch('prepare', time='48:00:00')]
+        candidates = available('candidates', prep_new) if not done_candidates else []
+        candidate_new = not done_candidates and not candidates
+        candidate_ids = [j['id'] for j in candidates]
+        if candidate_new:
+            candidate_ids = [sbatch('candidates', prep_ids)]
+        chromosomes = available('chromosome', candidate_new)
+        active_chroms = set()
+        dependencies = list(dict.fromkeys(prep_ids + candidate_ids))
+        for job in chromosomes:
+            task = job['id'].split('_')
+            if len(task) == 2 and task[1].isdigit():
+                if int(task[1]) in set(chroms) - done_chroms:
+                    active_chroms.add(int(task[1]))
+                    dependencies.append(job['id'])
+            elif len(task) == 1:
+                # Some schedulers render an array parent rather than expanded tasks.
+                active_chroms.update(set(chroms) - done_chroms)
+                dependencies.append(job['id'])
+        missing = sorted(set(chroms) - done_chroms - active_chroms)
+        if missing:
+            dependencies.append(sbatch('chromosome', list(dict.fromkeys(prep_ids + candidate_ids)), selected=missing,
+                                       time='48:00:00', cpus_per_task=cfg.get('download_workers', 4)))
+        merges = available('merge', bool(missing) or candidate_new or prep_new)
+        if not merges:
+            sbatch('merge', dependencies)
+        print('Run reconciled:', json.dumps(jobs), '\nFinal manifests:', output / 'merge', flush=True)
 
 
 def merge(cfg, chroms, directory, output):
@@ -978,6 +1197,48 @@ def merge(cfg, chroms, directory, output):
     return summary
 
 
+def execute_stage(cfg, stage, chrom, chroms):
+    output = local(cfg['output_dir'])
+    output.mkdir(parents=True, exist_ok=True)
+    stage_name = f'chr_{chrom}' if stage == 'chromosome' else stage
+    with (output / f'.{stage_name}.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        preflight = output / 'provenance' / 'preflight.json'
+        if preflight.exists() and stage != 'prepare':
+            snapshot = json.loads(preflight.read_text())
+            if snapshot.get('pending_reference_preparation'):
+                raise ValueError('Reference preparation has not completed; wait for the prepare job')
+            for expected in snapshot['inputs']:
+                if identity(expected['path']) != expected:
+                    raise ValueError(f'Input changed after submission: {expected["path"]}')
+        stage_name = f'chr_{chrom}' if stage == 'chromosome' else stage
+        destination = output / stage_name
+        if stage_complete(output, stage_name, cfg, chroms) and (stage != 'prepare' or not input_inventory(cfg, chroms)[1]):
+            print(f'Reusing completed stage: {destination}', flush=True)
+            return
+        if destination.exists():
+            recovery = output / 'recovery'
+            recovery.mkdir(exist_ok=True)
+            destination.replace(recovery / f'{stage_name}.{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")}')
+        temporary = output / f'.{stage_name}.{os.environ["SLURM_JOB_ID"]}.partial'
+        # SLURM can requeue a job with the same ID; its unpublished stage directory
+        # is safe to reuse, while the completed destination above remains protected.
+        temporary.mkdir(exist_ok=True)
+        if stage == 'prepare':
+            summary = prepare_references(cfg, chroms)
+        elif stage == 'candidates':
+            summary = candidates(cfg, temporary)
+        elif stage == 'chromosome':
+            summary = process_chromosome(cfg, chrom, temporary, output)
+        else:
+            summary = merge(cfg, chroms, temporary, output)
+        manifest = {'config': cfg, 'stage': stage_name, 'chromosomes': list(chroms), 'summary': summary,
+                    'code_sha256': digest(Path(__file__))}
+        (temporary / 'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
+        temporary.replace(destination)
+        print(json.dumps(manifest, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default='config.json')
@@ -989,13 +1250,22 @@ def main():
     parser.add_argument('--max-concurrent', type=int, default=2)
     parser.add_argument('--download-workers', type=int)
     parser.add_argument('--scratch-dir')
-    parser.add_argument('--chromosomes', default='1-22')
+    parser.add_argument('--account')
+    parser.add_argument('--chromosomes')
     parser.add_argument('--chrom', type=int, choices=range(1,23))
     args = parser.parse_args()
     if args.check_only:
         args.stage = 'check'
     if (args.download_sources or args.download_references or args.stage in ('submit', 'check')) and os.environ.get('SLURM_JOB_ID'):
         parser.error('Run downloads/preflight/submission from the login node')
+    if args.chromosomes is None:
+        try:
+            raw_cfg = json.loads(local(args.config).read_text())
+            saved_run = local(raw_cfg['output_dir']) / 'provenance' / 'run.json'
+            saved = json.loads(saved_run.read_text()) if saved_run.exists() else {}
+            args.chromosomes = ','.join(map(str, saved['chromosomes'])) if saved else '1-22'
+        except (OSError, ValueError, KeyError) as exc:
+            parser.error(str(exc))
     chroms = []
     for token in args.chromosomes.split(','):
         if not re.fullmatch(r'[0-9]+(?:-[0-9]+)?', token):
@@ -1021,6 +1291,8 @@ def main():
             cfg['download_workers'] = args.download_workers
         if args.scratch_dir is not None:
             cfg['scratch_dir'] = args.scratch_dir
+        if args.account is not None:
+            cfg['slurm_account'] = args.account
         if args.download_references or args.stage == 'submit':
             download_references(cfg, chroms)
             if args.download_references:
@@ -1040,37 +1312,7 @@ def main():
         raise SystemExit('Run processing under SLURM; only --stage check belongs on login')
     if args.stage == 'chromosome' and args.chrom is None:
         parser.error('--chrom is required')
-    output = local(cfg['output_dir'])
-    output.mkdir(parents=True, exist_ok=True)
-    preflight = output / 'provenance' / 'preflight.json'
-    if preflight.exists() and args.stage != 'prepare':
-        snapshot = json.loads(preflight.read_text())
-        if snapshot.get('pending_reference_preparation'):
-            raise ValueError('Reference preparation has not completed; wait for the prepare job')
-        for expected in snapshot['inputs']:
-            if identity(expected['path']) != expected:
-                raise ValueError(f'Input changed after submission: {expected["path"]}')
-    stage = f'chr_{args.chrom}' if args.stage == 'chromosome' else args.stage
-    destination = output / stage
-    if destination.exists():
-        raise FileExistsError(f'{destination} exists; use a new version/output_dir or remove only the failed stage')
-    temporary = output / f'.{stage}.{os.environ["SLURM_JOB_ID"]}.partial'
-    # SLURM can requeue a job with the same ID; its unpublished stage directory
-    # is safe to reuse, while the completed destination above remains protected.
-    temporary.mkdir(exist_ok=True)
-    if args.stage == 'prepare':
-        summary = prepare_references(cfg, chroms)
-    elif args.stage == 'candidates':
-        summary = candidates(cfg, temporary)
-    elif args.stage == 'chromosome':
-        summary = process_chromosome(cfg, args.chrom, temporary, output)
-    else:
-        summary = merge(cfg, chroms, temporary, output)
-    manifest = {'config': cfg, 'stage': stage, 'summary': summary,
-                'code_sha256': digest(Path(__file__))}
-    (temporary / 'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
-    temporary.replace(destination)
-    print(json.dumps(manifest, indent=2))
+    execute_stage(cfg, args.stage, args.chrom, chroms)
 
 
 if __name__ == '__main__':

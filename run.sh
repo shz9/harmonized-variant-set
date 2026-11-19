@@ -5,12 +5,13 @@ cd "$(dirname "$0")"
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
   cat <<'HELP'
 Usage: bash run.sh [options]
+  --account ACCOUNT     SLURM billing account (default: config/environment/job.sbatch)
   --config FILE         Configuration (relative to this project's root)
   --download-sources    Download missing HapMap3+/Catalog files, then exit
   --download-references Download reference files/indexes, then exit (no jobs)
   --setup-only          Create environment, install/check dependencies, then exit
   --check-only          Check existing environment/resources; do not submit
-  --chromosomes LIST    Autosomes, e.g. 22 or 1-3,22 (default: 1-22)
+  --chromosomes LIST    Autosomes, e.g. 22 or 1-3,22 (default: saved run, otherwise 1-22)
   --max-concurrent N    Maximum simultaneous chromosome jobs (default: 2)
   --download-workers N  Parallel slices per chromosome download (default: 4)
   --scratch-dir DIR     Raw gnomAD download storage (default: /scratch/szabad)

@@ -77,6 +77,9 @@ class PreparationTests(unittest.TestCase):
         pause = patch.object(hvs, 'sleep')
         pause.start()
         self.addCleanup(pause.stop)
+        scheduler = patch.object(hvs, 'scheduler_jobs', return_value=[])
+        scheduler.start()
+        self.addCleanup(scheduler.stop)
         self.cfg = json.loads((MODULE.parent / 'config.json').read_text())
         self.cfg.update(picard_command=['picard'], dbsnp_vcf='data/reference/dbsnp.gz',
                         scratch_dir=str(self.root / 'scratch'))
@@ -537,21 +540,26 @@ class OfflineIntegrationTests(unittest.TestCase):
 
 
 class SubmissionTests(unittest.TestCase):
-    def test_dependencies_snapshot_and_duplicate_submission_guard(self):
+    def test_dependencies_snapshot_and_active_job_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = {'output_dir':str(Path(tmp)/'output'), 'picard_command': ['picard']}
             with patch.object(hvs, 'ROOT', Path(tmp)), patch.object(hvs, 'check_inputs', return_value={}), \
                     patch.object(hvs.shutil, 'which', return_value='/bin/sbatch'), \
+                    patch.object(hvs, 'scheduler_jobs', return_value=[]), \
                     patch.object(hvs.subprocess, 'check_output', side_effect=['101\n', '102;cluster\n', '103\n']) as submit:
                 hvs.submit(cfg, [21, 22], 2)
                 calls = [c.args[0] for c in submit.call_args_list]
                 self.assertIn('--dependency=afterok:101', calls[1])
                 self.assertIn('--array=21,22%2', calls[1])
-                self.assertIn('--dependency=afterok:102', calls[2])
+                dependency = next(x for x in calls[2] if x.startswith('--dependency='))
+                self.assertIn('102', dependency.split(':')[1:])
                 provenance = Path(tmp)/'output'/'provenance'
                 self.assertEqual(json.loads((provenance/'config.json').read_text()), cfg)
                 self.assertEqual((provenance/'workflow.py').read_bytes(), MODULE.read_bytes())
-                with self.assertRaises(FileExistsError):
+                active = [{'id': job, 'root': job.split('_')[0], 'stage': stage,
+                           'state': 'PENDING', 'reason': 'Priority'} for stage, job in
+                          [('candidates', '101'), ('chromosome', '102_21'), ('chromosome', '102_22'), ('merge', '103')]]
+                with patch.object(hvs, 'scheduler_jobs', return_value=active):
                     hvs.submit(cfg, [21, 22], 2)
                 self.assertEqual(submit.call_count, 3)
 

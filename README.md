@@ -128,14 +128,15 @@ Run from this project's root (the directory containing `run.sh`):
 
 ```bash
 # One command: environment, downloads, reference preparation and analysis.
-bash run.sh --chromosomes 22
+bash run.sh --account def-sgravel --chromosomes 22
 
 # Production: choose a fresh output_dir/version after the pilot.
 bash run.sh --chromosomes 1-22 --max-concurrent 2 --download-workers 4 --scratch-dir /scratch/szabad
 ```
 
-No manual resource download or index creation is required. The default without
-`--chromosomes` processes 1–22. Common references are staged first; gnomAD VCFs
+No manual resource download or index creation is required. On a new run the
+default without `--chromosomes` processes 1–22; on a retry it reuses the saved
+chromosome list. Common references are staged first; gnomAD VCFs
 are downloaded **inside chromosome SLURM jobs**, after the candidate list and
 canonical allele keys are available. Defaults are two concurrent chromosome jobs
 and four download threads per job. Each chromosome job requests 8 GiB, four CPUs
@@ -168,9 +169,34 @@ The count table and manifest are published atomically and checked before the
 job deletes its managed raw gnomAD VCF and index. Failed downloads/extractions
 retain scratch data for retry. A matching count cache skips both downloading
 and extraction on a worker retry; input/ancestry-group signatures and a table
-SHA256 prevent stale or corrupt cache reuse. Existing submission/output guards
-still apply: rerunning the launcher does not automatically resubmit failed jobs.
+SHA256 prevent stale or corrupt cache reuse. Rerunning the same launcher command
+automatically resumes missing/failed stages and reuses completed stages and
+active jobs in the same output directory.
 Chromosome compute nodes need outbound HTTPS access to the download host.
+
+The default account is read from `job.sbatch` (currently `def-sgravel`). Supply
+`--account def-sgravel` explicitly, or set `slurm_account` in `config.json`, to
+override it. `SBATCH_ACCOUNT` is also supported when the configuration does not
+specify an account. Every submitted stage receives the selected `--account`.
+An account rejection leaves the run recoverable: rerun the same command after
+correcting the account. No output-directory change or provenance deletion is
+needed.
+
+The launcher checks SLURM state itself with `squeue` and `sacct`. It reuses
+pending/running jobs, submits only missing or failed chromosomes, and replaces
+pending downstream jobs whose dependencies failed or were replaced. A durable
+submission journal and run-specific SLURM comments recover jobs accepted before
+the launcher could save their IDs. Submission and worker-stage locks prevent
+duplicate launchers or requeued workers from repeating completed work. If the
+scheduler cannot be queried reliably, submission stops before duplicating jobs;
+rerun when the scheduler is available.
+
+Completed runs are a no-op on rerun. Incomplete stage directories are retained
+under `output/<version>/recovery/` before being rebuilt; count caches and partial
+scratch downloads are preserved. Account, scratch and download-worker settings
+can change on retry. Changes to scientific selection settings or an explicitly
+different chromosome list require a separate output version to avoid mixing
+panels.
 
 Optional commands:
 
@@ -303,14 +329,16 @@ these are not cryptographic verification. Use only trusted, pre-normalized
 gnomAD/dbSNP sources: indexed position queries precede normalization, so an
 arbitrarily padded, nonnormalized indel could otherwise be missed upstream.
 
-Configuration and workflow code are copied into `output_dir/provenance` before
-submission. Source hashes, the resolved Catalog snapshot, configuration, code
-hashes, exclusion counts and ancestry selection counts are recorded in stage manifests. Existing submission
-provenance prevents duplicate submissions into the same version. Outputs appear
-atomically after each stage completes; failures retain `.partial` directories
-and logs. If a job fails, inspect `provenance/jobs.json` and the logs, cancel any
-remaining jobs, and use a fresh output directory for a clean retry. This initial
-workflow does not automatically resume partially completed releases.
+Configuration, workflow code and the worker script are frozen into immutable
+revision files under `output_dir/provenance` before submission. Queued/running
+jobs keep their original revision when the launcher is updated. `jobs.json`
+records current job IDs, `submissions.json` records submission attempts and
+recovered jobs, and `run.json` records the requested chromosomes and account.
+Source hashes, the resolved Catalog snapshot, configuration, code hashes,
+exclusion counts and ancestry selection counts are recorded in stage manifests.
+Outputs appear atomically after each stage completes. Retry the same launcher
+command to recover; there is no need to inspect job IDs, cancel failed dependency
+chains manually, delete provenance, or discard cached data.
 
 ## Outputs and build conventions
 

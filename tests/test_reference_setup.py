@@ -135,6 +135,8 @@ class ReferenceSetupTests(unittest.TestCase):
         def external(command, **kwargs):
             if command[0] == 'bcftools':
                 return 'bcftools fixture'
+            if command[0] in ('squeue', 'sacct'):
+                return ''
             self.assertEqual(command[0], 'sbatch')
             jobs.append(command)
             return str(100 + len(jobs))
@@ -149,7 +151,8 @@ class ReferenceSetupTests(unittest.TestCase):
                             self.assertEqual(len(jobs), 4)
                             self.assertIn('--time=48:00:00', jobs[0])
                             for index in range(1, 4):
-                                self.assertIn(f'--dependency=afterok:{100 + index}', jobs[index])
+                                dep = next(x for x in jobs[index] if x.startswith('--dependency='))
+                                self.assertIn(str(100 + index), dep.split(':')[1:])
                             output = self.project / self.cfg['output_dir']
                             provenance = output / 'provenance'
                             self.assertTrue(json.loads((provenance / 'preflight.json').read_text())['pending_reference_preparation'])
@@ -169,6 +172,14 @@ class ReferenceSetupTests(unittest.TestCase):
                                                     hvs.main()
                                         # Same allocation/job ID, matching a SLURM requeue.
                                         hvs.main()
+                            # A second launcher call after completion is a no-op.
+                            count = len(self.requests)
+                            submitted = len(jobs)
+                            with patch('sys.argv', ['workflow.py', '--config', str(self.config), '--chromosomes', '22']):
+                                with redirect_stdout(io.StringIO()):
+                                    hvs.main()
+                            self.assertEqual(len(jobs), submitted)
+                            self.assertEqual(len(self.requests), count)
                             # Existing resources are reused without another HTTP request.
                             count = len(self.requests)
                             hvs.download_references(self.cfg, [22])
