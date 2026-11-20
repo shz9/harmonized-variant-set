@@ -486,3 +486,169 @@ FASTA/VCF IO and bcftools through pysam, with Picard isolated by a mock and a
 command-contract test. A real chromosome-22 run with the staged reference files
 is still required to validate the external Picard/chain/reference combination,
 measure retention and confirm cluster runtime before production.
+
+
+## Functional expansion and AlphaGenome 1 (optional v0.2 workflow)
+
+The original `config.json` still reproduces the HapMap3+/GWAS workflow.
+Use a separate configuration/output version for functional discovery:
+
+```bash
+# Functional annotations are downloaded automatically on login.
+bash run.sh --config config.functional.json --chromosomes 22
+# Use a fresh output_dir before switching a chromosome pilot to production.
+bash run.sh --config config.functional.json --chromosomes 1-22
+```
+
+The example selects up to **5 million master variants**, with a desired minimum
+of **3 million**. These are master counts, not guaranteed counts per ancestry.
+It preserves the complete canonicalized HapMap3+/Catalog backbone, including its
+rare hits. New variants must pass the original ancestry-specific gnomAD genomes
+`MAF > 0.005 AND MAC > 20` rule in at least one configured ancestry.
+If fewer than 3 million eligible variants are available, the report explicitly
+says `below_minimum`; unrelated variants are not added to fill a quota.
+
+### Functional regions and supported alleles
+
+`config.functional.json` freezes GENCODE v50 basic and ENCODE Registry V4.
+The worker discovers variants directly from gnomAD, independently of rsIDs or
+GWAS significance. Regions are:
+
+- CDS, including annotated start/stop codons;
+- 20 intronic bases adjoining each exon–intron junction;
+- UTRs and lncRNA exons;
+- promoters from 2 kb upstream through 500 bp downstream of each basic
+  protein-coding/lncRNA transcript's TSS, respecting strand (both endpoints included);
+- all eight ENCODE cCRE classes, preserving their individual element identifiers.
+
+GTF coordinates are converted from 1-based inclusive to BED's 0-based half-open
+convention. BED sources use exact boundaries. Overlaps retain every category,
+gene and element label. Splice flanks are selection windows, not predicted
+splice consequences; CDS membership does not distinguish missense from synonymous.
+Optional conservation or BaselineLD-derived intervals can be added under `beds`
+with category `CONSERVED` or another supported category. BaselineLD's intercept,
+MAF and LD-related annotations must not be exported as functional intervals.
+
+New alleles are biallelic SNPs and normalized simple insertions/deletions of
+1–49 bases excluding the shared VCF anchor. Other replacements, symbolic and
+multiallelic records are excluded. Common PASS alleles are normalized **before**
+intersecting functional intervals; deletion spans and insertion breakpoints
+are considered, avoiding anchor-only overlap errors. Indels are retained without
+an AlphaGenome score. Existing build-validation rules still apply: GRCh37 failure
+does not remove a GRCh38 variant.
+
+### AlphaGenome 1 / Atlas AVI
+
+Use `config.functional-avi.json` after placing the downloaded, unzipped
+`alphagenome_variant_impact_score_snvs.tsv.gz` **and its `.tbi` index** at the
+configured shared path. Obtain the original file through the
+[official AlphaGenome downloads page](https://deepmind.google.com/science/alphagenome/downloads).
+That page currently requires sign-in; this repository does not bundle the data,
+credentials or a guessed direct download URL. A versioned direct URL may be set
+in the resource configuration for automatic download of the data file; its index
+must also be staged. No model inference/API calls occur on workers.
+
+The native tabix input has these columns:
+
+```text
+#CHROM  POS  REF  ALT  raw_score  PHRED
+```
+
+Workers use indexed `bcftools annotate` matching chromosome, position, REF and
+ALT against the common-variant candidates. They do not load or enumerate all
+possible substitutions in Python. The example uses **AVI PHRED >=30** as a
+configurable high-score inclusion rule, including variants outside the functional
+intervals. AVI combines AlphaGenome 1 regulatory predictions with other evidence;
+it is distinct from an individual AlphaGenome track score and from AlphaGenome 2.
+The threshold is a prioritization choice, not a pathogenicity classification or
+a percentile calibrated within common variants. See the
+[AVI VEP plugin documentation](https://github.com/Ensembl/VEP_plugins/blob/release/116/AVI.pm).
+
+Smaller score tables are also supported. For example, replace the `alphagenome1`
+resource list with:
+
+```json
+[
+  {
+    "path": "data/functional/ag1_scores.tsv.gz",
+    "release": "your verified AlphaGenome 1 score snapshot",
+    "build": "GRCh38",
+    "model": "AlphaGenome1",
+    "format": "table",
+    "kind": "quantile",
+    "score_column": "quantile_score",
+    "scorer": "your recorded scorer and calibration",
+    "threshold": 0.99
+  }
+]
+```
+
+Tables need explicit `CHROM POS REF ALT` columns, a `VARIANT_KEY`, or native tidy
+`variant_id` values such as `chr22:250:A>C`. Alleles are normalized/reference-checked
+before matching. `kind` can be `avi_phred`, `quantile`, or `raw`; thresholds and
+release/model provenance are required. Quantile/raw selection uses absolute
+magnitude, so the table must contain comparable scorer/track outputs. Use
+`filters` (column names mapped to lists of accepted strings) to restrict an
+export to particular scorers, tracks or tissues, or provide separate resources
+with separate thresholds. Raw values are never compared across score sources.
+Optional `columns` maps input column names to canonical names, and `separator`
+can be changed from tab to comma. Missing/nonfinite scores fail explicitly.
+
+### Comparison with standard PRS panels
+
+To prioritize high-score variants missing from specified panels, supply their
+**normalized GRCh38 allele manifests**, for example:
+
+```json
+"prs_panels": [
+  {
+    "name": "SBayesRC_7M",
+    "path": "data/functional/sbayesrc7m.grch38.tsv.gz",
+    "release": "your verified SBayesRC panel snapshot",
+    "build": "GRCh38",
+    "normalized": true
+  }
+]
+```
+
+The manifest needs `VARIANT_KEY` or `CHROM POS REF ALT`. Native SBayesRC
+`snp.info` A1/A2 columns are not REF/ALT, and GRCh37 positions must not be relabeled
+as GRCh38; orient, normalize and validate any converted panel first. Membership
+uses exact alleles, not rsID aliases. No SBayesRC manifest is bundled.
+`PRS_STATUS=absent_from_supplied_panels` means absent from **all supplied lists**,
+not proven to lack LD proxies. With no comparison lists it is `not_assessed`;
+the workflow never silently claims novelty against unspecified standard panels.
+
+### Size selection, audit and operational behavior
+
+The merge applies the global budget after collecting the chromosome candidate
+pools. Priority is: preserved backbone; qualifying AlphaGenome variants absent
+from the supplied PRS panels; other qualifying AlphaGenome variants; CDS; splice
+flanks; UTR; promoters; conserved regions; enhancers; lncRNA exons; other regulatory
+regions. Within an oversubscribed tier, each candidate is assigned deterministically
+to one eligible ancestry using an allele-key hash. Equal budgets are allocated
+across nonempty ancestry strata and unused capacity is redistributed. Remaining
+ties use the stable hash. This avoids a global-European-frequency ranking, but
+does not guarantee equal ancestry counts or optimal LD tagging.
+
+The final merge contains:
+
+- the existing master and ancestry/build manifests, restricted to the same selected identities;
+- `panel_selection.tsv.gz`: every candidate's selection status, priority, ancestry
+  stratum and reason, including budget exclusions;
+- `functional_expansion.json`: pool/backbone/final counts, size status, category
+  and allele-type counts, AlphaGenome selection counts and PRS comparison coverage.
+
+Category counts overlap and must not be summed. Full candidate pools and ancestry
+audits remain under the chromosome directories, and direct-discovery counts are
+cached under `functional_counts/chr_N/`. Sources/releases, annotation hashes and
+large indexed-resource identities are recorded. Changed scientific settings or
+inputs require a fresh output version. Both discovery and backbone count caches
+must be available before a retry can skip staging the raw gnomAD VCF.
+Managed gnomAD files are deleted only after both caches have been published;
+existing candidate-only caches cannot supply the functional expansion.
+
+This implementation expands functional coverage; it does not measure LD coverage
+or add a genetic-map-based genome-wide scaffold. The local regression suite uses
+real FASTA/VCF/tabix IO and bcftools through pysam; production still requires the
+normal cluster tools and staged references.

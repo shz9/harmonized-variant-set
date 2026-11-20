@@ -167,6 +167,9 @@ def load_config(filename):
     cfg['wall_time'] = wall_time(cfg.get('wall_time', '01:00:00'))
     if not isinstance(cfg['download_workers'], int) or not 1 <= cfg['download_workers'] <= 32:
         raise ValueError('download_workers must be between 1 and 32')
+    validate_functional_config(cfg)
+    if functional_settings(cfg):
+        cfg['functional_input_identity'] = [identity(path) for path in functional_input_paths(cfg) if nonempty(path)]
     return resolve_catalog_release(cfg)
 
 
@@ -287,7 +290,8 @@ def candidates(cfg, directory):
     table = pd.concat(frames, ignore_index=True).drop_duplicates()
     for chrom in range(1, 23):
         table.loc[table.CHROM.eq(chrom)].to_csv(directory / f'chr_{chrom}.tsv.gz', sep='\t', index=False)
-    return {'candidate_rows': len(table), 'hapmap3_accepted_rows': len(hm3),
+    functional_summary = functional_prepare(cfg, directory)
+    return {'functional_expansion': functional_summary, 'candidate_rows': len(table), 'hapmap3_accepted_rows': len(hm3),
             'hapmap3_rejected_rows': len(hm3_rejected),
             'hapmap3_rejection_reasons': hm3_rejected.REASON.value_counts().to_dict(),
             'significant_catalog_rows': significant,
@@ -459,7 +463,12 @@ def process_chromosome(cfg, chrom, directory, output):
         canonical = tmp / 'canonical.vcf'
         with pysam.FastaFile(str(ref38)) as fasta:
             write_vcf(master, canonical, fasta)
+        additions = functional_discover(cfg, chrom, tmp, output) if functional_settings(cfg) else None
         frequencies, duplicate = candidate_counts(cfg, chrom, master, tmp, output)
+        if additions is not None:
+            master = functional_join(master, additions, frequencies, duplicate)
+            with pysam.FastaFile(str(ref38)) as expanded_fasta:
+                write_vcf(master, canonical, expanded_fasta)
         # Build mapping is independent of ancestry filtering and preserves stable GRCh38 IDs.
         lifted, back = tmp / 'lifted37.vcf', tmp / 'returned38.vcf'
         liftover(cfg, canonical, lifted, local(cfg['chain_38_to_37']), ref37, directory / 'rejected37.vcf')
@@ -518,6 +527,7 @@ def input_inventory(cfg, chroms):
     vcfs = [local(cfg['dbsnp_vcf'])] + [p for c in chroms
         if nonempty(p := local(cfg['gnomad_vcf'].format(chrom=c)))]
     required += vcfs
+    required += functional_input_paths(cfg)
     missing_indexes = []
     for vcf in vcfs:
         index = next((Path(str(vcf)+ext) for ext in ('.tbi', '.csi')
@@ -573,7 +583,9 @@ def count_cache_ready(output, chrom):
 
 def staged_chromosomes(cfg, chroms):
     output = local(cfg['output_dir'])
-    return {chrom for chrom in chroms if count_cache_ready(output, chrom)
+    return {chrom for chrom in chroms if (count_cache_ready(output, chrom) and (not functional_settings(cfg)
+            or (nonempty(output / 'functional_counts' / f'chr_{chrom}' / 'variants.tsv.gz')
+                and nonempty(output / 'functional_counts' / f'chr_{chrom}' / 'manifest.json'))))
             or nonempty(local(cfg['gnomad_vcf'].format(chrom=chrom)))
             or (nonempty(managed_gnomad(cfg, chrom, output))
                 and nonempty(Path(str(managed_gnomad(cfg, chrom, output)) + '.tbi'))
@@ -675,6 +687,7 @@ def download_sources(cfg):
             raise ValueError(f'Automatic download requires {key} to use {expected_suffix}; '
                              f'stage your custom-format source manually at {destination}')
         download_source(key, destination, urls)
+    functional_downloads(cfg)
     resolved = resolve_catalog_release(dict(cfg))
     print('Sources staged. Catalog snapshot:', resolved['gwas_catalog_release'], flush=True)
 
@@ -980,6 +993,9 @@ def stage_complete(output, stage, cfg, chroms):
             return False
         if stage == 'candidates':
             files = [f'chr_{c}.tsv.gz' for c in range(1, 23)]
+            if functional_settings(cfg):
+                files += [f'{prefix}.chr_{c}.tsv.gz' for c in range(1, 23)
+                          for prefix in ('functional_regions', 'alphagenome1', 'prs_panels')]
         elif stage == 'merge' or stage.startswith('chr_'):
             files = ['master.GRCh38.tsv.gz'] + [f'{a}.{build}.tsv.gz' for a in cfg['ancestries']
                       for build in ('GRCh38', 'GRCh37')]
@@ -987,6 +1003,8 @@ def stage_complete(output, stage, cfg, chroms):
                 files += [f'{a}.audit.tsv.gz' for a in cfg['ancestries']]
             elif manifest.get('chromosomes') != list(chroms):
                 return False
+            elif functional_settings(cfg):
+                files += ['functional_expansion.json', 'panel_selection.tsv.gz']
         else:
             files = []
         return all(nonempty(directory / name) for name in files)
@@ -1435,6 +1453,8 @@ def show_status(cfg):
             print(state['worker_log'])
 
 def merge(cfg, chroms, directory, output):
+    if functional_settings(cfg):
+        return functional_merge(cfg, chroms, directory, output)
     names = ['master.GRCh38'] + [f'{a}.{build}' for a in cfg['ancestries'] for build in ('GRCh38', 'GRCh37')]
     summary = {}
     for name in names:
@@ -1492,6 +1512,604 @@ def execute_stage(cfg, stage, chrom, chroms):
         (temporary / 'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
         temporary.replace(destination)
         print(json.dumps(manifest, indent=2))
+
+
+
+# Functional expansion is opt-in; legacy discovery and exports remain reproducible.
+FUNCTIONAL_CATEGORIES = ('CODING', 'SPLICE_FLANK', 'UTR', 'PROMOTER',
+                         'CONSERVED', 'ENHANCER', 'LNCRNA_EXON', 'OTHER_REGULATORY')
+FUNCTIONAL_META = ['FUNCTIONAL_CATEGORIES', 'FUNCTIONAL_ELEMENTS', 'FUNCTIONAL_GENES',
+                   'AG1_EVIDENCE', 'PRS_PANELS', 'PRS_STATUS', 'ELIGIBLE_ANCESTRIES',
+                   'PANEL_PRIORITY', 'VARIANT_TYPE']
+
+
+def functional_settings(cfg):
+    settings = cfg.get('functional_expansion', {})
+    return settings if settings.get('enabled', False) else None
+
+
+def functional_resources(cfg):
+    settings = functional_settings(cfg)
+    if not settings:
+        return []
+    return [settings['gencode'], *settings.get('beds', []),
+            *settings.get('alphagenome1', []), *settings.get('prs_panels', [])]
+
+
+def validate_functional_config(cfg):
+    settings = functional_settings(cfg)
+    if not settings:
+        return
+    bounds = [settings.get(k, d) for k, d in
+              (('min_variants', 3000000), ('target_variants', 4000000), ('max_variants', 5000000))]
+    if any(type(v) is not int or v <= 0 for v in bounds) or not bounds[0] <= bounds[1] <= bounds[2]:
+        raise ValueError('Functional panel requires positive min_variants <= target_variants <= max_variants')
+    if type(settings.get('indel_max_bp', 49)) is not int or not 1 <= settings.get('indel_max_bp', 49) <= 49:
+        raise ValueError('indel_max_bp must be in 1..49')
+    for key, default in (('splice_flank_bp', 20), ('promoter_upstream_bp', 2000), ('promoter_downstream_bp', 500)):
+        if type(settings.get(key, default)) is not int or settings.get(key, default) < 0:
+            raise ValueError(f'{key} must be a nonnegative integer')
+    for resource in functional_resources(cfg):
+        if not all(resource.get(k) for k in ('path', 'release')) or resource.get('build') != 'GRCh38':
+            raise ValueError('Functional resources require path, release and build=GRCh38')
+    for bed in settings.get('beds', []):
+        if bed.get('category') not in FUNCTIONAL_CATEGORIES or not bed.get('label'):
+            raise ValueError('Functional BED requires a label and a supported category')
+    for panel in settings.get('prs_panels', []):
+        if panel.get('normalized') is not True:
+            raise ValueError('PRS membership requires normalized=true and normalized GRCh38 allele keys')
+        if not re.fullmatch(r'[A-Za-z0-9_.-]+', panel.get('name', '')):
+            raise ValueError('PRS panel requires a simple unique name')
+    if len({p['name'] for p in settings.get('prs_panels', [])}) != len(settings.get('prs_panels', [])):
+        raise ValueError('PRS panel names must be unique')
+    for score in settings.get('alphagenome1', []):
+        if score.get('format', 'table') not in ('table', 'atlas_tabix'):
+            raise ValueError('AlphaGenome format must be table or atlas_tabix')
+        if score.get('format') == 'atlas_tabix' and score.get('kind') != 'avi_phred':
+            raise ValueError('atlas_tabix requires kind=avi_phred')
+        kind = score.get('kind')
+        if score.get('model') != 'AlphaGenome1' or kind not in ('avi_phred', 'quantile', 'raw'):
+            raise ValueError('AlphaGenome inputs require model=AlphaGenome1 and kind=avi_phred, quantile or raw')
+        threshold = score.get('threshold')
+        if not isinstance(threshold, (int, float)) or not math.isfinite(threshold) or threshold <= 0:
+            raise ValueError('AlphaGenome score threshold must be explicit, finite and positive')
+        if kind == 'quantile' and threshold > 1:
+            raise ValueError('AlphaGenome quantile threshold must be <= 1')
+        if kind != 'avi_phred' and not score.get('scorer'):
+            raise ValueError('Track-level AlphaGenome input requires scorer provenance')
+
+
+def functional_input_paths(cfg):
+    paths = [local(r['path']) for r in functional_resources(cfg)]
+    for resource in functional_resources(cfg):
+        if resource.get('format') == 'atlas_tabix':
+            paths.append(local(resource['path'] + '.tbi'))
+    return paths
+
+
+def functional_downloads(cfg):
+    """Stage public annotations on login; authenticated score files must be supplied locally."""
+    if not functional_settings(cfg):
+        return
+    require_login_network()
+    validate_functional_config(cfg)
+    for resource in functional_resources(cfg):
+        target = local(resource['path'])
+        if nonempty(target):
+            continue
+        if not resource.get('url'):
+            raise FileNotFoundError(f'Functional input missing: {target}; supply the versioned file or its download URL')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        pending = target.with_name(target.name + '.partial')
+        request = Request(resource['url'], headers={'User-Agent': 'harmonized-variant-set/0.2'})
+        with urlopen(request, timeout=120) as incoming, pending.open('wb') as outgoing:
+            if 'text/html' in incoming.headers.get('Content-Type', ''):
+                raise ValueError(f'Functional download returned HTML/sign-in page: {resource["url"]}')
+            shutil.copyfileobj(incoming, outgoing, length=1024 * 1024)
+        if not nonempty(pending):
+            raise ValueError(f'Empty functional download: {resource["url"]}')
+        # Validate compressed streams before installing them.
+        if target.suffix == '.gz':
+            with gzip.open(pending, 'rb') as handle:
+                while handle.read(1024 * 1024):
+                    pass
+        pending.replace(target)
+        atomic_json(target.with_name(target.name + '.download.json'),
+                    {'url': resource['url'], 'release': resource['release'], 'sha256': digest(target)})
+
+
+def functional_text(path):
+    return gzip.open(path, 'rt') if str(path).endswith('.gz') else Path(path).open()
+
+
+def functional_variant_columns(frame):
+    """Accept allele columns, normalized keys, or AlphaGenome tidy variant_id strings."""
+    frame = frame.copy()
+    if not set(KEY) <= set(frame):
+        field = 'VARIANT_KEY' if 'VARIANT_KEY' in frame else 'variant_id'
+        if field not in frame:
+            raise ValueError('Variant input needs CHROM/POS/REF/ALT, VARIANT_KEY or variant_id')
+        pattern = r'^(?:chr)?([0-9]+):([1-9][0-9]*):([ACGT]+)[:>]([ACGT]+)$'
+        extracted = frame[field].str.extract(pattern)
+        if extracted.isna().any(axis=None):
+            raise ValueError('Invalid explicit DNA allele key in functional input')
+        extracted.columns = KEY
+        for column in KEY:
+            frame[column] = extracted[column]
+    chrom = frame.CHROM.map(chrom_number)
+    pos = pd.to_numeric(frame.POS, errors='coerce')
+    valid = chrom.notna() & pos.gt(0) & pos.mod(1).eq(0)
+    valid &= frame.REF.str.fullmatch('[ACGT]+') & frame.ALT.str.fullmatch('[ACGT]+') & frame.REF.ne(frame.ALT)
+    if not valid.all():
+        raise ValueError('Functional variant tables must contain valid autosomal DNA alleles and 1-based positions')
+    frame['CHROM'] = 'chr' + chrom.astype(int).astype(str)
+    frame['POS'] = pos.astype('int64')
+    frame['VARIANT_KEY'] = [variant_key(*row) for row in frame[KEY].itertuples(index=False, name=None)]
+    return frame
+
+
+def functional_prepare(cfg, directory):
+    """Freeze labeled BED intervals, high-score allele candidates and PRS membership by chromosome."""
+    settings = functional_settings(cfg)
+    if not settings:
+        return {}
+    intervals = defaultdict(set)
+    transcripts = defaultdict(list)
+    genes = {}
+    def add(chrom, start, end, category, element, gene=''):
+        if end > max(0, start):
+            intervals[chrom].add((max(0, start), end, category, element, gene))
+    with functional_text(local(settings['gencode']['path'])) as handle:
+        for line in handle:
+            if line.startswith('#'):
+                continue
+            fields = line.rstrip('\n').split('\t')
+            if len(fields) != 9:
+                raise ValueError('GENCODE input must be a nine-column GTF')
+            chrom = chrom_number(fields[0])
+            if chrom is None:
+                continue
+            attributes = dict(re.findall(r'(\w+) "([^"]*)"', fields[8]))
+            if 'basic' not in re.findall(r'tag "([^"]*)"', fields[8]):
+                continue
+            biotype = attributes.get('gene_type', attributes.get('gene_biotype'))
+            if biotype not in ('protein_coding', 'lncRNA', 'lincRNA'):
+                continue
+            start, end = int(fields[3])-1, int(fields[4])
+            if start < 0 or end <= start or fields[6] not in ('+', '-'):
+                raise ValueError('Invalid GENCODE coordinates or strand')
+            gene = attributes.get('gene_id', '')
+            transcript = attributes.get('transcript_id', '')
+            element = transcript or gene
+            feature = fields[2]
+            if feature in ('CDS', 'start_codon', 'stop_codon'):
+                add(chrom, start, end, 'CODING', element, gene)
+            elif feature == 'UTR':
+                add(chrom, start, end, 'UTR', element, gene)
+            elif feature == 'exon':
+                transcripts[(chrom, transcript)].append((start, end))
+                genes[(chrom, transcript)] = gene
+                if biotype != 'protein_coding':
+                    add(chrom, start, end, 'LNCRNA_EXON', element, gene)
+            elif feature == 'transcript':
+                tss = start if fields[6] == '+' else end-1
+                up, down = settings.get('promoter_upstream_bp', 2000), settings.get('promoter_downstream_bp', 500)
+                left, right = (up, down) if fields[6] == '+' else (down, up)
+                add(chrom, tss-left, tss+right+1, 'PROMOTER', element, gene)
+    flank = settings.get('splice_flank_bp', 20)
+    for (chrom, transcript), exons in transcripts.items():
+        exons = sorted(set(exons))
+        for (_, left_end), (right_start, _) in zip(exons, exons[1:]):
+            if right_start < left_end:
+                raise ValueError(f'Overlapping exons within transcript {transcript}')
+            add(chrom, left_end, min(left_end+flank, right_start), 'SPLICE_FLANK', transcript, genes[(chrom, transcript)])
+            add(chrom, max(left_end, right_start-flank), right_start, 'SPLICE_FLANK', transcript, genes[(chrom, transcript)])
+    for bed in settings.get('beds', []):
+        with functional_text(local(bed['path'])) as handle:
+            for number, line in enumerate(handle, 1):
+                if not line.strip() or line.startswith(('#', 'track ', 'browser ')):
+                    continue
+                fields = line.rstrip('\n').split('\t')
+                if len(fields) < 3:
+                    raise ValueError(f'Malformed BED: {bed["path"]}:{number}')
+                chrom = chrom_number(fields[0])
+                if chrom is None:
+                    continue
+                start, end = int(fields[1]), int(fields[2])
+                if start < 0 or end <= start:
+                    raise ValueError(f'Invalid zero-based half-open BED: {bed["path"]}:{number}')
+                identifier = fields[3] if len(fields) > 3 else f'chr{chrom}:{start}-{end}'
+                add(chrom, start, end, bed['category'], bed['label'] + ':' + identifier)
+    if not any(intervals.values()):
+        raise ValueError('Functional annotation sources produced no autosomal intervals')
+    region_columns = ['START', 'END', 'CATEGORY', 'ELEMENT', 'GENE']
+    scores = defaultdict(list)
+    score_audit = []
+    import pysam
+    for index, source in enumerate(settings.get('alphagenome1', [])):
+        if source.get('format') == 'atlas_tabix':
+            score_audit.append({'source': index, 'mode': 'indexed_exact_allele_annotation_in_chromosome_worker'})
+            continue
+        passing = []
+        total = 0
+        column = source.get('score_column', {'avi_phred': 'AVI', 'quantile': 'quantile_score', 'raw': 'raw_score'}[source['kind']])
+        with pd.read_csv(local(source['path']), sep=source.get('separator', '\t'), dtype=str,
+                                 keep_default_na=False, chunksize=50000) as score_chunks:
+            for chunk in score_chunks:
+                chunk = chunk.rename(columns=source.get('columns', {}))
+                if column not in chunk:
+                    raise ValueError(f'AlphaGenome score column missing: {column}')
+                total += len(chunk)
+                values = pd.to_numeric(chunk[column], errors='coerce')
+                if values.isna().any() or not values.map(math.isfinite).all():
+                    raise ValueError('AlphaGenome input contains missing/nonfinite scores')
+                if source['kind'] == 'avi_phred' and values.lt(0).any():
+                    raise ValueError('AVI PHRED scores must be nonnegative')
+                if source['kind'] == 'quantile' and values.abs().gt(1).any():
+                    raise ValueError('AlphaGenome quantile scores must be in [-1, 1]')
+                if source.get('filters'):
+                    for field, allowed in source['filters'].items():
+                        if field not in chunk:
+                            raise ValueError(f'AlphaGenome filter column missing: {field}')
+                        chunk = chunk.loc[chunk[field].isin(allowed)]
+                    values = values.loc[chunk.index]
+                chosen = chunk.loc[values.abs().ge(source['threshold'])].copy()
+                if chosen.empty:
+                    continue
+                chosen = functional_variant_columns(chosen)
+                for row in chosen.to_dict('records'):
+                    evidence = {'release': source['release'], 'model': 'AlphaGenome1', 'kind': source['kind'],
+                                'score': float(row[column]), 'threshold': source['threshold'], 'source': index}
+                    for field in ('variant_scorer', 'output_type', 'track_name', 'biosample_curie', 'gene_id'):
+                        if row.get(field):
+                            evidence[field] = row[field]
+                    if source.get('scorer'):
+                        evidence['configured_scorer'] = source['scorer']
+                    passing.append({**{k: row[k] for k in KEY}, 'VARIANT_KEY': row['VARIANT_KEY'],
+                                    'EVIDENCE': json.dumps(evidence, sort_keys=True)})
+        score_audit.append({'source': index, 'rows': total, 'passing_rows': len(passing)})
+        if passing:
+            table = pd.DataFrame(passing)
+            raw, normal = directory / f'ag1.{index}.vcf', directory / f'ag1.{index}.norm.vcf.gz'
+            with pysam.FastaFile(str(local(cfg['reference_grch38']))) as fasta:
+                write_vcf(table.drop_duplicates('VARIANT_KEY'), raw, fasta)
+            normalize(raw, normal, local(cfg['reference_grch38']), directory)
+            mapped = vcf_table(normal).rename(columns={'VARIANT_KEY': 'OLD_KEY'})
+            table = mapped.merge(table[['VARIANT_KEY', 'EVIDENCE']].rename(columns={'VARIANT_KEY': 'OLD_KEY'}),
+                                 on='OLD_KEY', validate='one_to_many')
+            for row in table.itertuples(index=False):
+                scores[chrom_number(row.CHROM)].append((variant_key(row.CHROM, row.POS, row.REF, row.ALT), row.EVIDENCE))
+            for path in (raw, normal, Path(str(normal)+'.tbi')):
+                path.unlink()
+    panels = defaultdict(set)
+    for panel in settings.get('prs_panels', []):
+        for chunk in pd.read_csv(local(panel['path']), sep='\t', dtype=str, keep_default_na=False, chunksize=50000):
+            chunk = functional_variant_columns(chunk)
+            for row in chunk.itertuples(index=False):
+                panels[chrom_number(row.CHROM)].add((row.VARIANT_KEY, panel['name']))
+    for chrom in range(1, 23):
+        pd.DataFrame(sorted(intervals[chrom]), columns=region_columns).to_csv(
+            directory / f'functional_regions.chr_{chrom}.tsv.gz', sep='\t', index=False)
+        pd.DataFrame(sorted(set(scores[chrom])), columns=['VARIANT_KEY', 'EVIDENCE']).to_csv(
+            directory / f'alphagenome1.chr_{chrom}.tsv.gz', sep='\t', index=False)
+        pd.DataFrame(sorted(panels[chrom]), columns=['VARIANT_KEY', 'PANEL']).to_csv(
+            directory / f'prs_panels.chr_{chrom}.tsv.gz', sep='\t', index=False)
+    return {'intervals': sum(map(len, intervals.values())), 'alphagenome1': score_audit,
+            'resources': [dict(r, identity=identity(local(r['path'])),
+                               sha256=None if r.get('format') == 'atlas_tabix' else digest(local(r['path'])))
+                          for r in functional_resources(cfg)]}
+
+
+class FunctionalIntervalIndex:
+    """Sorted interval index with prefix maxima; retains every overlapping label."""
+    def __init__(self, frame):
+        self.rows = sorted(frame.itertuples(index=False, name=None))
+        self.starts = [row[0] for row in self.rows]
+        maximum = 0
+        self.ends = []
+        for row in self.rows:
+            maximum = max(maximum, row[1])
+            self.ends.append(maximum)
+
+    def overlaps(self, start, end):
+        from bisect import bisect_left
+        index = bisect_left(self.starts, end)-1
+        result = []
+        while index >= 0 and self.ends[index] > start:
+            row = self.rows[index]
+            if row[1] > start:
+                result.append(row)
+            index -= 1
+        return result
+
+
+def functional_span(pos, ref, alt):
+    """Affected reference bases; insertions touch both sides of their breakpoint."""
+    start = pos-1
+    while ref and alt and ref[0] == alt[0]:
+        start += 1
+        ref, alt = ref[1:], alt[1:]
+    while ref and alt and ref[-1] == alt[-1]:
+        ref, alt = ref[:-1], alt[:-1]
+    return (start, start+len(ref)) if ref else (max(0, start-1), start+1)
+
+
+def functional_variant_type(ref, alt, limit=49):
+    if not DNA.fullmatch(ref) or not DNA.fullmatch(alt) or ref == alt:
+        return None
+    if len(ref) == len(alt) == 1:
+        return 'SNP'
+    # Normalized simple indels have a single shared anchor, not replacement sequence.
+    if min(len(ref), len(alt)) == 1 and ref[0] == alt[0] and 1 <= abs(len(ref)-len(alt)) <= limit:
+        return 'INSERTION' if len(alt) > len(ref) else 'DELETION'
+    return None
+
+
+def functional_priority(categories, high_score=False, novel=False):
+    if high_score:
+        return 1 if novel else 2
+    return min((3 + FUNCTIONAL_CATEGORIES.index(c) for c in categories), default=99)
+
+
+def functional_discover(cfg, chrom, work, output):
+    """Scan common PASS alleles genome-wide, then intersect normalized alleles with evidence."""
+    import pysam
+    settings = functional_settings(cfg)
+    columns = ['VARIANT_KEY', *KEY, 'RSIDS', 'SOURCES', 'POS37_NATIVE', *FUNCTIONAL_META]
+    groups = sorted({g for values in cfg['ancestries'].values() for g in values})
+    fields = [f'{metric}_{g}' for g in groups for metric in ('AC', 'AN')]
+    columns += fields
+    cache = output / 'functional_counts' / f'chr_{chrom}'
+    prepared = output / 'candidates'
+    paths = [prepared / f'{prefix}.chr_{chrom}.tsv.gz' for prefix in ('functional_regions', 'alphagenome1', 'prs_panels')]
+    source = local(cfg['gnomad_vcf'].format(chrom=chrom))
+    owned = not nonempty(source)
+    signature = {'schema': 1, 'settings': settings, 'ancestries': cfg['ancestries'],
+                 'maf_gt': cfg['maf_gt'], 'mac_gt': cfg['mac_gt'],
+                 'resources': [identity(p) for p in functional_input_paths(cfg)],
+                 'prepared_sha256': [digest(p) for p in paths],
+                 'reference': identity(local(cfg['reference_grch38'])),
+                 'source': cfg.get('reference_urls', {}).get('gnomad_vcf', REFERENCE_URLS['gnomad_vcf']).format(chrom=chrom)
+                           if owned else identity(source)}
+    if cache.exists():
+        manifest = json.loads((cache / 'manifest.json').read_text())
+        if manifest['signature'] != signature or digest(cache / 'variants.tsv.gz') != manifest['sha256']:
+            raise ValueError('Functional cache changed or corrupted; use a new output version')
+        table = pd.read_csv(cache / 'variants.tsv.gz', sep='\t', keep_default_na=False, dtype=str)
+        table['POS'] = table.POS.astype('int64')
+        table['PANEL_PRIORITY'] = table.PANEL_PRIORITY.astype(int)
+        return table
+    if owned:
+        source = managed_gnomad(cfg, chrom, output)
+    if not nonempty(source):
+        raise FileNotFoundError('Functional discovery needs staged gnomAD VCF; resume the login controller')
+    with pysam.VariantFile(str(source)) as handle:
+        if not set(fields) <= set(handle.header.info):
+            raise ValueError(f'gnomAD header missing ancestry fields: {set(fields) - set(handle.header.info)}')
+    # Restrict by frequency before normalization/annotation, but never by source POS:
+    # left alignment can move indels across a functional boundary.
+    expressions = []
+    for values in cfg['ancestries'].values():
+        ac = '(' + '+'.join('INFO/AC_'+g for g in values) + ')'
+        an = '(' + '+'.join('INFO/AN_'+g for g in values) + ')'
+        expressions.append(f'({an}>0 && {ac}>{cfg["mac_gt"]} && ({an}-{ac})>{cfg["mac_gt"]}'
+                           f' && {ac}/{an}>{cfg["maf_gt"]} && (1-{ac}/{an})>{cfg["maf_gt"]})')
+    subset, normal = work / 'functional.common.vcf.gz', work / 'functional.normalized.vcf.gz'
+    run('bcftools', 'view', '-f', 'PASS', '-m2', '-M2', '-v', 'snps,indels', '-i', ' || '.join(expressions),
+        '-Oz', '-o', subset, source)
+    normalize(subset, normal, local(cfg['reference_grch38']), work)
+    atlas_fields = []
+    for index, score_source in enumerate(settings.get('alphagenome1', [])):
+        if score_source.get('format') != 'atlas_tabix':
+            continue
+        with pysam.TabixFile(str(local(score_source['path']))) as atlas:
+            if f'chr{chrom}' not in atlas.contigs:
+                raise ValueError('Atlas input must use chr-prefixed GRCh38 contigs')
+            headers = [h.lstrip('#').split('\t') for h in atlas.header if h.startswith('#CHROM')]
+            if not headers or headers[-1] != ['CHROM', 'POS', 'REF', 'ALT', 'raw_score', 'PHRED']:
+                raise ValueError('Atlas input needs #CHROM POS REF ALT raw_score PHRED columns')
+        field = f'AG1_AVI_{index}'
+        header = work / f'avi.{index}.header.txt'
+        header.write_text(f'##INFO=<ID={field},Number=1,Type=Float,Description="AlphaGenome1 Atlas AVI PHRED">\n')
+        annotated = work / f'avi.{index}.vcf.gz'
+        run('bcftools', 'annotate', '-a', local(score_source['path']),
+            '-c', f'CHROM,POS,REF,ALT,-,INFO/{field}', '-h', header, '-Oz', '-o', annotated, normal)
+        run('bcftools', 'index', '--force', '--tbi', annotated)
+        normal = annotated
+        atlas_fields.append((field, score_source))
+    regions = pd.read_csv(paths[0], sep='\t', keep_default_na=False)
+    interval_index = FunctionalIntervalIndex(regions)
+    score_map, panel_map = defaultdict(set), defaultdict(set)
+    for key, evidence in pd.read_csv(paths[1], sep='\t', keep_default_na=False).itertuples(index=False, name=None):
+        score_map[key].add(evidence)
+    for key, panel in pd.read_csv(paths[2], sep='\t', keep_default_na=False).itertuples(index=False, name=None):
+        panel_map[key].add(panel)
+    rows, stats = [], defaultdict(int)
+    with pysam.VariantFile(str(normal)) as handle:
+        for record in handle:
+            stats['normalized_common_records'] += 1
+            if chrom_number(record.contig) != chrom:
+                raise ValueError('gnomAD chromosome file contains another chromosome')
+            kind = functional_variant_type(record.ref, record.alts[0], settings.get('indel_max_bp', 49))
+            if not kind:
+                stats['unsupported_alleles'] += 1
+                continue
+            counts = {f: scalar(record.info.get(f)) for f in fields}
+            eligible = [a for a, values in cfg['ancestries'].items()
+                        if frequency(counts, values, cfg['maf_gt'], cfg['mac_gt'])['STATUS'] == 'pass']
+            if not eligible:
+                stats['failed_exact_frequency_check'] += 1
+                continue
+            key = variant_key(f'chr{chrom}', record.pos, record.ref, record.alts[0])
+            overlaps = interval_index.overlaps(*functional_span(record.pos, record.ref, record.alts[0]))
+            categories = sorted({row[2] for row in overlaps})
+            evidence = set(score_map.get(key, set()))
+            for field, score_source in atlas_fields:
+                value = scalar(record.info.get(field))
+                if value is not None and math.isfinite(value) and value >= score_source['threshold']:
+                    evidence.add(json.dumps({'model': 'AlphaGenome1', 'kind': 'avi_phred',
+                        'release': score_source['release'], 'score': value,
+                        'threshold': score_source['threshold']}, sort_keys=True))
+            if not categories and not evidence:
+                stats['outside_functional_regions_and_scores'] += 1
+                continue
+            memberships = panel_map.get(key, set())
+            status = ('present' if memberships else 'absent_from_supplied_panels') if settings.get('prs_panels') else 'not_assessed'
+            row = {'VARIANT_KEY': key, 'CHROM': f'chr{chrom}', 'POS': record.pos,
+                   'REF': record.ref, 'ALT': record.alts[0], 'RSIDS': record.id or '',
+                   'SOURCES': ';'.join((['FUNCTIONAL_REGION'] if categories else []) + (['ALPHAGENOME1'] if evidence else [])),
+                   'POS37_NATIVE': '', 'FUNCTIONAL_CATEGORIES': ';'.join(categories),
+                   'FUNCTIONAL_ELEMENTS': ';'.join(sorted({r[3] for r in overlaps})),
+                   'FUNCTIONAL_GENES': ';'.join(sorted({r[4] for r in overlaps if r[4]})),
+                   'AG1_EVIDENCE': '[' + ','.join(sorted(evidence)) + ']', 'PRS_PANELS': ';'.join(sorted(memberships)),
+                   'PRS_STATUS': status, 'ELIGIBLE_ANCESTRIES': ';'.join(sorted(eligible)),
+                   'PANEL_PRIORITY': functional_priority(categories, bool(evidence), status == 'absent_from_supplied_panels'),
+                   'VARIANT_TYPE': kind, **{f: json.dumps(counts[f]) for f in fields}}
+            rows.append(row)
+    table = pd.DataFrame(rows, columns=columns)
+    duplicates = table.VARIANT_KEY.duplicated(keep=False)
+    stats['duplicate_normalized_records'] = int(duplicates.sum())
+    table = table.loc[~duplicates].copy()
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    pending = Path(tempfile.mkdtemp(prefix=f'.chr_{chrom}.', dir=cache.parent))
+    table.to_csv(pending / 'variants.tsv.gz', sep='\t', index=False)
+    atomic_json(pending / 'manifest.json', {'signature': signature, 'sha256': digest(pending / 'variants.tsv.gz'),
+                                          'selected_candidates': len(table), 'outcomes': dict(stats)})
+    pending.replace(cache)
+    return table
+
+
+def functional_join(master, additions, frequencies, duplicate):
+    """Keep backbone identity/provenance; add direct gnomAD allele counts for new candidates."""
+    base = master.set_index('VARIANT_KEY', drop=False)
+    extra = additions.set_index('VARIANT_KEY', drop=False)
+    for key in set(base.index) & set(extra.index):
+        for field in ('SOURCES', 'RSIDS'):
+            extra.at[key, field] = ';'.join(sorted(set(filter(None, str(base.at[key, field]).split(';') + str(extra.at[key, field]).split(';')))))
+        extra.at[key, 'POS37_NATIVE'] = base.at[key, 'POS37_NATIVE']
+    for field in FUNCTIONAL_META:
+        base[field] = 0 if field == 'PANEL_PRIORITY' else ''
+    combined = pd.concat([base.loc[~base.index.isin(extra.index)], extra[base.columns]], ignore_index=True)
+    combined = combined.sort_values(KEY).reset_index(drop=True)
+    count_fields = [c for c in additions if c.startswith(('AC_', 'AN_'))]
+    for row in additions.to_dict('records'):
+        # Do not conceal duplicate records detected by the backbone extraction.
+        if row['VARIANT_KEY'] not in duplicate:
+            frequencies[row['VARIANT_KEY']] = {'PASS': True, **{f: json.loads(row[f]) for f in count_fields}}
+    return combined
+
+
+def functional_merge(cfg, chroms, directory, output):
+    """Bound the master globally, preserving the backbone and balancing ancestry strata within tiers."""
+    import sqlite3
+    settings = functional_settings(cfg)
+    database = directory / 'selection.sqlite'
+    # This file belongs only to the unpublished merge stage and can be rebuilt on requeue.
+    for suffix in ('', '-journal', '-wal', '-shm'):
+        Path(str(database)+suffix).unlink(missing_ok=True)
+    connection = sqlite3.connect(database)
+    connection.execute('PRAGMA temp_store=FILE')
+    connection.execute('CREATE TABLE variants (key TEXT PRIMARY KEY, priority INTEGER, stratum TEXT, rank TEXT, selected INTEGER)')
+    ancestry_names = sorted(cfg['ancestries'])
+    pool = 0
+    candidate_categories, selected_categories = defaultdict(int), defaultdict(int)
+    candidate_types, selected_types = defaultdict(int), defaultdict(int)
+    score_counts = defaultdict(int)
+    for chrom in chroms:
+        for chunk in pd.read_csv(output / f'chr_{chrom}' / 'master.GRCh38.tsv.gz', sep='\t', dtype=str,
+                                 keep_default_na=False, chunksize=50000):
+            rows = []
+            for row in chunk.to_dict('records'):
+                backbone = bool({'HAPMAP3_PLUS', 'GWAS_CATALOG'} & set(row['SOURCES'].split(';')))
+                priority = 0 if backbone else int(row['PANEL_PRIORITY'])
+                rank = hashlib.sha256(row['VARIANT_KEY'].encode()).hexdigest()[:16]
+                eligible = sorted(filter(None, row['ELIGIBLE_ANCESTRIES'].split(';')))
+                if not backbone and (not eligible or not set(eligible) <= set(ancestry_names)):
+                    raise ValueError('Expanded variant has no valid ancestry eligibility')
+                stratum = eligible[int(rank, 16) % len(eligible)] if eligible else ''
+                for category in filter(None, row['FUNCTIONAL_CATEGORIES'].split(';')):
+                    candidate_categories[category] += 1
+                candidate_types[row['VARIANT_TYPE'] or 'BACKBONE_UNCLASSIFIED'] += 1
+                score_counts['qualified_candidates'] += int(bool(row['AG1_EVIDENCE'] and row['AG1_EVIDENCE'] != '[]'))
+                rows.append((row['VARIANT_KEY'], priority, stratum, rank, int(backbone)))
+            connection.executemany('INSERT INTO variants VALUES (?,?,?,?,?)', rows)
+            pool += len(rows)
+    connection.execute('CREATE INDEX ranking ON variants(priority, stratum, selected, rank)')
+    backbone = connection.execute('SELECT count(*) FROM variants WHERE selected=1').fetchone()[0]
+    maximum = settings.get('max_variants', 5000000)
+    if backbone > maximum:
+        connection.close()
+        raise ValueError('Preserved backbone exceeds max_variants; increase the budget explicitly')
+    target = min(maximum, max(backbone, settings.get('target_variants', 4000000)))
+    remaining = target-backbone
+    priorities = [r[0] for r in connection.execute('SELECT DISTINCT priority FROM variants WHERE selected=0 ORDER BY priority')]
+    for priority in priorities:
+        while remaining:
+            strata = [r[0] for r in connection.execute(
+                'SELECT DISTINCT stratum FROM variants WHERE priority=? AND selected=0', (priority,))]
+            if not strata:
+                break
+            quota = max(1, remaining // len(strata))
+            for stratum in sorted(strata):
+                if not remaining:
+                    break
+                cursor = connection.execute('UPDATE variants SET selected=1 WHERE key IN '
+                    '(SELECT key FROM variants WHERE priority=? AND stratum=? AND selected=0 ORDER BY rank,key LIMIT ?)',
+                    (priority, stratum, min(quota, remaining)))
+                remaining -= cursor.rowcount
+    connection.commit()
+    with gzip.open(directory / 'panel_selection.tsv.gz', 'wt') as audit:
+        audit.write('VARIANT_KEY\tPANEL_PRIORITY\tANCESTRY_STRATUM\tSELECTED\tREASON\n')
+        for key, priority, stratum, selected in connection.execute(
+                'SELECT key,priority,stratum,selected FROM variants ORDER BY key'):
+            reason = 'BACKBONE' if priority == 0 else 'EVIDENCE_SELECTED' if selected else 'BUDGET_EXCLUDED'
+            audit.write(f'{key}\t{priority}\t{stratum}\t{selected}\t{reason}\n')
+    names = ['master.GRCh38'] + [f'{a}.{build}' for a in cfg['ancestries'] for build in ('GRCh38', 'GRCh37')]
+    summary = {}
+    for name in names:
+        first, count = True, 0
+        with gzip.open(directory / f'{name}.tsv.gz', 'wt') as destination:
+            for chrom in chroms:
+                for chunk in pd.read_csv(output / f'chr_{chrom}' / f'{name}.tsv.gz', sep='\t', dtype=str,
+                                         keep_default_na=False, chunksize=50000):
+                    keys = chunk.VARIANT_KEY.tolist()
+                    selected = set()
+                    # Stay below SQLite's parameter limit on older cluster installations.
+                    for offset in range(0, len(keys), 900):
+                        part = keys[offset:offset+900]
+                        selected.update(r[0] for r in connection.execute(
+                            'SELECT key FROM variants WHERE selected=1 AND key IN (' + ','.join('?' for _ in part) + ')', part))
+                    chunk = chunk.loc[chunk.VARIANT_KEY.isin(selected)]
+                    if name == 'master.GRCh38':
+                        for row in chunk.to_dict('records'):
+                            for category in filter(None, row['FUNCTIONAL_CATEGORIES'].split(';')):
+                                selected_categories[category] += 1
+                            selected_types[row['VARIANT_TYPE'] or 'BACKBONE_UNCLASSIFIED'] += 1
+                            high = bool(row['AG1_EVIDENCE'] and row['AG1_EVIDENCE'] != '[]')
+                            score_counts['selected'] += int(high)
+                            score_counts['outside_supplied_prs_panels_selected'] += int(high and row['PRS_STATUS'] == 'absent_from_supplied_panels')
+                            score_counts['membership_not_assessed_selected'] += int(high and row['PRS_STATUS'] == 'not_assessed')
+                    chunk.to_csv(destination, sep='\t', index=False, header=first)
+                    first = False
+                    count += len(chunk)
+        summary[name] = count
+    report = {'candidate_pool': pool, 'backbone_preserved': backbone, 'target': target,
+              'minimum': settings.get('min_variants', 3000000), 'maximum': maximum,
+              'selected_master': summary['master.GRCh38'],
+              'size_status': 'below_minimum' if summary['master.GRCh38'] < settings.get('min_variants', 3000000) else 'within_range',
+              'functional_categories': {'candidates': dict(candidate_categories), 'selected': dict(selected_categories)},
+              'variant_types': {'candidates': dict(candidate_types), 'selected': dict(selected_types)},
+              'alphagenome1_counts': dict(score_counts),
+              'alphagenome1_enabled': bool(settings.get('alphagenome1')),
+              'prs_panels_assessed': [p['name'] for p in settings.get('prs_panels', [])],
+              'selection': 'backbone, evidence tier, equal ancestry strata, stable allele hash; no LD coverage guarantee',
+              'tiers': [dict(priority=p, candidates=n, selected=k) for p, n, k in connection.execute(
+                  'SELECT priority,count(*),sum(selected) FROM variants GROUP BY priority ORDER BY priority')]}
+    atomic_json(directory / 'functional_expansion.json', report)
+    connection.close()
+    database.unlink()
+    print('Functional expansion:', json.dumps(report), flush=True)
+    return summary
 
 
 def main():

@@ -1,0 +1,142 @@
+{
+  "panel_version": "v0.2.0-functional-avi",
+  "output_dir": "output/v0.2.0-functional-avi",
+  "hapmap3_plus": "data/map_hm3_plus.rds",
+  "gwas_catalog": "data/gwas-catalog-associations.zip",
+  "gwas_catalog_release": "auto",
+  "gwas_catalog_build": "GRCh38",
+  "gwas_p_threshold": 5e-08,
+  "gnomad_release": "4.1",
+  "scratch_dir": "/scratch/szabad",
+  "download_workers": 4,
+  "wall_time": "01:00:00",
+  "gnomad_data_type": "genomes",
+  "gnomad_vcf": "data/gnomad/gnomad.genomes.v4.1.sites.chr{chrom}.vcf.bgz",
+  "dbsnp_vcf": "/scratch/szabad/harmonized-variant-set/reference/GCF_000001405.40.gz",
+  "reference_grch38": "data/reference/hg38.fa",
+  "reference_grch37": "data/reference/hg19.fa",
+  "chain_38_to_37": "data/reference/hg38ToHg19.over.chain.gz",
+  "chain_37_to_38": "data/reference/hg19ToHg38.over.chain.gz",
+  "picard_command": [
+    "java",
+    "-jar",
+    "$EBROOTPICARD/picard.jar"
+  ],
+  "maf_gt": 0.005,
+  "mac_gt": 20,
+  "require_pass": true,
+  "ancestries": {
+    "AFR": [
+      "afr"
+    ],
+    "AMR": [
+      "amr"
+    ],
+    "CSA": [
+      "sas"
+    ],
+    "EAS": [
+      "eas"
+    ],
+    "EUR": [
+      "nfe"
+    ],
+    "MID": [
+      "mid"
+    ]
+  },
+  "functional_expansion": {
+    "enabled": true,
+    "min_variants": 3000000,
+    "target_variants": 5000000,
+    "max_variants": 5000000,
+    "indel_max_bp": 49,
+    "splice_flank_bp": 20,
+    "promoter_upstream_bp": 2000,
+    "promoter_downstream_bp": 500,
+    "gencode": {
+      "path": "data/functional/gencode.v50.basic.annotation.gtf.gz",
+      "url": "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_50/gencode.v50.basic.annotation.gtf.gz",
+      "release": "GENCODE v50 basic",
+      "build": "GRCh38"
+    },
+    "beds": [
+      {
+        "build": "GRCh38",
+        "release": "ENCODE Registry V4",
+        "label": "ENCODE_PLS",
+        "category": "PROMOTER",
+        "path": "data/functional/GRCh38-cCREs.PLS.bed",
+        "url": "https://downloads.wenglab.org/Registry-V4/GRCh38-cCREs.PLS.bed"
+      },
+      {
+        "build": "GRCh38",
+        "release": "ENCODE Registry V4",
+        "label": "ENCODE_pELS",
+        "category": "ENHANCER",
+        "path": "data/functional/GRCh38-cCREs.pELS.bed",
+        "url": "https://downloads.wenglab.org/Registry-V4/GRCh38-cCREs.pELS.bed"
+      },
+      {
+        "build": "GRCh38",
+        "release": "ENCODE Registry V4",
+        "label": "ENCODE_dELS",
+        "category": "ENHANCER",
+        "path": "data/functional/GRCh38-cCREs.dELS.bed",
+        "url": "https://downloads.wenglab.org/Registry-V4/GRCh38-cCREs.dELS.bed"
+      },
+      {
+        "build": "GRCh38",
+        "release": "ENCODE Registry V4",
+        "label": "ENCODE_CA-CTCF",
+        "category": "OTHER_REGULATORY",
+        "path": "data/functional/GRCh38-cCREs.CA-CTCF.bed",
+        "url": "https://downloads.wenglab.org/Registry-V4/GRCh38-cCREs.CA-CTCF.bed"
+      },
+      {
+        "build": "GRCh38",
+        "release": "ENCODE Registry V4",
+        "label": "ENCODE_CA-H3K4me3",
+        "category": "OTHER_REGULATORY",
+        "path": "data/functional/GRCh38-cCREs.CA-H3K4me3.bed",
+        "url": "https://downloads.wenglab.org/Registry-V4/GRCh38-cCREs.CA-H3K4me3.bed"
+      },
+      {
+        "build": "GRCh38",
+        "release": "ENCODE Registry V4",
+        "label": "ENCODE_CA-TF",
+        "category": "OTHER_REGULATORY",
+        "path": "data/functional/GRCh38-cCREs.CA-TF.bed",
+        "url": "https://downloads.wenglab.org/Registry-V4/GRCh38-cCREs.CA-TF.bed"
+      },
+      {
+        "build": "GRCh38",
+        "release": "ENCODE Registry V4",
+        "label": "ENCODE_CA",
+        "category": "OTHER_REGULATORY",
+        "path": "data/functional/GRCh38-cCREs.CA.bed",
+        "url": "https://downloads.wenglab.org/Registry-V4/GRCh38-cCREs.CA.bed"
+      },
+      {
+        "build": "GRCh38",
+        "release": "ENCODE Registry V4",
+        "label": "ENCODE_TF",
+        "category": "OTHER_REGULATORY",
+        "path": "data/functional/GRCh38-cCREs.TF.bed",
+        "url": "https://downloads.wenglab.org/Registry-V4/GRCh38-cCREs.TF.bed"
+      }
+    ],
+    "alphagenome1": [
+      {
+        "path": "data/functional/alphagenome_variant_impact_score_snvs.tsv.gz",
+        "release": "AlphaGenome Atlas AVI snapshot 2026-08-27",
+        "build": "GRCh38",
+        "model": "AlphaGenome1",
+        "format": "atlas_tabix",
+        "kind": "avi_phred",
+        "threshold": 30
+      }
+    ],
+    "prs_panels": []
+  }
+}
